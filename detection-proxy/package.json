@@ -4,7 +4,8 @@
   "description": "AI/bot attacker detection reverse proxy in front of OWASP Juice Shop",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "dependencies": {
     "cookie-parser": "^1.4.6",

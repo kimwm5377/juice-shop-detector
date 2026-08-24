@@ -2,10 +2,22 @@ const crypto = require("crypto");
 
 // 세션 단위 데이터: 요청 로그 + 클라이언트 텔레메트리
 const sessions = new Map();
-// IP 단위 데이터: 세션이 자꾸 바뀌는(쿠키 미보존) 스크립트형 공격 탐지용
-const ipIndex = new Map();
+// IP + HTTP 헤더 fingerprint 단위 행위자 그룹.
+// Docker/NAT 환경에서 IP만으로 서로 다른 브라우저와 CLI를 합치지 않도록 분리한다.
+const actors = new Map();
+// 동일 Authorization Bearer Token의 SHA-256 hash 단위 요청 그룹
+const authGroups = new Map();
 
 const MAX_REQUESTS_PER_SESSION = 500; // 메모리 보호용 링버퍼 상한
+const MAX_REQUESTS_PER_AUTH_GROUP = MAX_REQUESTS_PER_SESSION * 2;
+
+function withoutAuthorizationHeaders(headers = {}) {
+  return Object.fromEntries(
+    Object.entries(headers).filter(
+      ([name]) => !["authorization", "proxy-authorization"].includes(name.toLowerCase())
+    )
+  );
+}
 
 function headerFingerprint(headers) {
   const relevant = [
@@ -15,6 +27,15 @@ function headerFingerprint(headers) {
     headers["accept-encoding"] || "",
   ].join("|");
   return crypto.createHash("sha1").update(relevant).digest("hex").slice(0, 12);
+}
+
+function deriveActorId(ip, fingerprint) {
+  const digest = crypto
+    .createHash("sha256")
+    .update(`${ip}\u0000${fingerprint}`)
+    .digest("hex")
+    .slice(0, 24);
+  return `actor:${digest}`;
 }
 
 function getOrCreateSession(sessionId, ip) {
@@ -27,6 +48,7 @@ function getOrCreateSession(sessionId, ip) {
       requests: [], // { ts, method, url, status }
       headerSample: null,
       fingerprint: null,
+      actorId: null,
       userAgent: null,
       telemetry: {
         mouseMoveCount: 0,
@@ -53,42 +75,78 @@ function truncateBody(body) {
   return str.length > MAX_BODY_LOG_CHARS ? str.slice(0, MAX_BODY_LOG_CHARS) + "…(truncated)" : str;
 }
 
-function recordRequest(sessionId, ip, { method, url, status, headers, body, tags }) {
+function recordRequest(sessionId, ip, { method, url, status, headers, body, tags, authGroupId }) {
   const s = getOrCreateSession(sessionId, ip);
+  const now = Date.now();
+  const fingerprint = headerFingerprint(headers);
+  const actorId = deriveActorId(ip, fingerprint);
 
   if (!s.headerSample) {
-    s.headerSample = headers;
-    s.fingerprint = headerFingerprint(headers);
+    // 분류에 필요한 헤더 특성은 유지하되 자격 증명은 저장하지 않는다.
+    s.headerSample = withoutAuthorizationHeaders(headers);
+    s.fingerprint = fingerprint;
+    s.actorId = actorId;
     s.userAgent = headers["user-agent"] || "";
   }
 
-  s.requests.push({
-    ts: Date.now(),
+  const requestRecord = {
+    ts: now,
     method,
     url,
     status,
     body: truncateBody(body),
     tags: tags || [],
-  });
+    authGroupId: authGroupId || null,
+  };
+  s.requests.push(requestRecord);
   if (s.requests.length > MAX_REQUESTS_PER_SESSION) {
     s.requests.shift();
   }
 
-  // IP(행위자) 인덱스 업데이트 - 세션 churn 감지 + 행위자 단위 집계 분석용.
-  // 공격자가 세션 쿠키를 보존하지 않고 요청을 흩뿌려도, IP 단위로 요청을 모아
-  // 볼륨/행동 feature를 계산할 수 있게 요청 레코드 자체를 여기에도 축적한다.
-  if (!ipIndex.has(ip)) {
-    ipIndex.set(ip, { sessionIds: new Set(), requestTimestamps: [], requests: [] });
+  if (authGroupId) {
+    if (!authGroups.has(authGroupId)) {
+      authGroups.set(authGroupId, {
+        id: authGroupId,
+        firstSeen: now,
+        lastSeen: now,
+        totalRequests: 0,
+        sessionIds: new Set(),
+        requests: [],
+      });
+    }
+    const authGroup = authGroups.get(authGroupId);
+    authGroup.lastSeen = now;
+    authGroup.totalRequests++;
+    authGroup.sessionIds.add(sessionId);
+    authGroup.requests.push({ ...requestRecord, sessionId });
+    if (authGroup.requests.length > MAX_REQUESTS_PER_AUTH_GROUP) {
+      authGroup.requests.shift();
+    }
   }
-  const ipEntry = ipIndex.get(ip);
-  ipEntry.sessionIds.add(sessionId);
-  ipEntry.requestTimestamps.push(Date.now());
-  ipEntry.requests.push({ ts: Date.now(), url, status, tags: tags || [] });
-  if (ipEntry.requestTimestamps.length > MAX_REQUESTS_PER_SESSION * 2) {
-    ipEntry.requestTimestamps.shift();
+
+  // 같은 IP에서도 브라우저/CLI fingerprint가 다르면 별도 Actor로 취급한다.
+  // 동일 fingerprint가 dlsid를 계속 바꾸는 경우에만 요청과 churn을 합산한다.
+  if (!actors.has(actorId)) {
+    actors.set(actorId, {
+      id: actorId,
+      ip,
+      fingerprint,
+      headerSample: withoutAuthorizationHeaders(headers),
+      userAgent: headers["user-agent"] || "",
+      firstSeen: now,
+      lastSeen: now,
+      totalRequests: 0,
+      sessionIds: new Set(),
+      requests: [],
+    });
   }
-  if (ipEntry.requests.length > MAX_REQUESTS_PER_SESSION * 2) {
-    ipEntry.requests.shift();
+  const actor = actors.get(actorId);
+  actor.lastSeen = now;
+  actor.totalRequests++;
+  actor.sessionIds.add(sessionId);
+  actor.requests.push({ ...requestRecord, sessionId });
+  if (actor.requests.length > MAX_REQUESTS_PER_SESSION * 2) {
+    actor.requests.shift();
   }
 
   return s;
@@ -113,8 +171,20 @@ function getAllSessions() {
   return Array.from(sessions.values());
 }
 
-function getIpEntry(ip) {
-  return ipIndex.get(ip);
+function getAllActors() {
+  return Array.from(actors.values());
+}
+
+function getActor(actorId) {
+  return actors.get(actorId);
+}
+
+function getAllAuthGroups() {
+  return Array.from(authGroups.values());
+}
+
+function getAuthGroup(authGroupId) {
+  return authGroups.get(authGroupId);
 }
 
 module.exports = {
@@ -123,6 +193,11 @@ module.exports = {
   recordTelemetry,
   getSession,
   getAllSessions,
-  getIpEntry,
+  getAllActors,
+  getActor,
+  getAllAuthGroups,
+  getAuthGroup,
   headerFingerprint,
+  deriveActorId,
+  withoutAuthorizationHeaders,
 };

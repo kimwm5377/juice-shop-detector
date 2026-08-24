@@ -7,7 +7,9 @@ OWASP Juice Shop 앞단에 붙는 리버스 프록시형 탐지 레이어입니�
 ```
 Browser / AI Agent ──▶ detection-proxy (:8080) ──▶ juice-shop (:3000)
                               │
-                              ├─ 요청 로그 (세션 쿠키 dlsid 기준)
+                              ├─ Session 로그 (세션 쿠키 dlsid 기준)
+                              ├─ Client Actor 집계 (IP + 헤더 fingerprint 기준)
+                              ├─ Auth Group 집계 (동일 Bearer token hash 기준)
                               ├─ HTML 응답에 telemetry.js 자동 주입
                               ├─ POST /__detection/telemetry 로 마우스/스크롤/DOM 이벤트 수집
                               └─ GET  /__detection/dashboard  실시간 대시보드
@@ -22,12 +24,14 @@ docker compose up --build
 - 앱 접속: http://localhost:8080  (Juice Shop이 이 포트를 통해 프록시됨)
 - 탐지 대시보드: http://localhost:8080/__detection/dashboard
 - 세션 API: http://localhost:8080/__detection/api/sessions
+- Client Actor API: http://localhost:8080/__detection/api/actors
+- Auth Group API: http://localhost:8080/__detection/api/auth-groups
 
 ## 사용한 탐지 Feature
 
 | Feature | 설명 | 위치 |
 |---|---|---|
-| 평균 요청 간격 / 규칙성(CV) | 너무 빠르거나(사람 반응속도 이하) 간격이 지나치게 일정하면 봇 의심 | `featureExtractor.js` → `avgIntervalMs`, `intervalCV` |
+| 평균 요청 간격 / 규칙성(CV) | 너무 빠르거나(사람 반응속도 이하) 간격이 지나치게 일정하면 봇 의심. Session/Actor/Auth Group별로 독립 계산 | `featureExtractor.js` → `avgIntervalMs`, `intervalCV` |
 | URL 다양성 | 짧은 시간에 매우 다양한 경로를 두드리면 엔드포인트 스캐닝(AI 정찰) 의심 | `urlDiversity` |
 | 404 비율 | 존재하지 않는 경로 요청 비율이 높으면 무차별 fuzzing/enumeration 의심 | `notFoundRatio` |
 | 헤더 Fingerprint | User-Agent가 자동화 도구(curl/python-requests/Playwright 등) 패턴이거나, 실브라우저가 항상 보내는 `Sec-Fetch-*`, `Accept-Language` 헤더가 없으면 의심 | `uaSignatures.js` |
@@ -35,7 +39,7 @@ docker compose up --build
 | Scroll 이벤트 | 스크롤이 전혀 없으면 봇 의심 | `scrollCount` |
 | DOM 이벤트 다양성 | click/keydown/focus 등 이벤트 종류가 다양할수록 사람일 가능성 | `domEventDiversity` |
 | 요청 Burst 길이 | 2초 슬라이딩 윈도우 내 최대 요청 수. 사람은 클릭 간 지연이 있음 | `maxBurst()` |
-| (추가) 세션 Churn | 같은 IP에서 세션 쿠키가 계속 바뀌면 쿠키를 보존하지 않는 스크립트일 가능성 | `sessionChurn` |
+| (추가) 세션 Churn | 같은 IP와 헤더 fingerprint에서 세션 쿠키가 계속 바뀌면 쿠키를 보존하지 않는 스크립트일 가능성. Actor/Auth Group에서 계산 | `sessionChurn` |
 
 각 feature는 0(사람 같음)~1(봇 같음)로 정규화된 뒤 가중합으로 최종 score(0~1)를 산출합니다
 (`lib/classifier.js`의 `WEIGHTS` 참고).
@@ -61,9 +65,40 @@ curl http://localhost:8080/__detection/api/sessions/<sessionId>/path
 curl http://localhost:8080/__detection/api/export -o detection-log-export.json
 ```
 
-각 요청 로그 항목은 `{ ts, method, url, status, body, tags }` 형태이며,
+각 요청 로그 항목은 `{ ts, method, url, status, body, tags, authGroupId }` 형태이며,
 `body`는 최대 2000자로 잘려 저장됩니다(메모리 보호). `tags`는 `lib/payloadSignatures.js`에
 정의된 정규식으로 자동 태깅되며, 필요에 맞게 시그니처를 추가/수정할 수 있습니다.
+
+## Authorization Auth Group
+
+프록시 요청의 `Authorization: Bearer <token>`은 raw token을 저장하지 않고 전체
+SHA-256 hash인 `auth:<64자리 hex>`로 즉시 변환됩니다. 같은 token을 사용한 요청은
+`dlsid`가 달라도 동일 Auth Group에 기록되며, Authorization이 없는 요청의
+`authGroupId`는 `null`입니다. Auth Group은 그룹에 속한 모든 요청과 세션 텔레메트리를
+하나의 행위자 흐름으로 집계해 세션과 동일한 classifier로 점수를 계산합니다. 대시보드에서
+Auth Group 행을 클릭하면 그룹 전체의 시간순 공격 경로를 볼 수 있습니다.
+
+```bash
+curl http://localhost:8080/__detection/api/auth-groups
+curl http://localhost:8080/__detection/api/auth-groups/<authGroupId>
+curl http://localhost:8080/__detection/api/auth-groups/<authGroupId>/path
+```
+
+## Client Actor
+
+Session 표는 각 `dlsid`에 기록된 요청만으로 점수를 계산합니다. 쿠키를 보존하지 않는
+CLI/스크립트 요청은 `IP + 헤더 fingerprint(User-Agent, Accept, Accept-Language,
+Accept-Encoding)`로 만든 Client Actor에서 별도로 합산합니다. 따라서 Docker/NAT에서
+동일 IP로 보이는 브라우저와 curl이 한 행으로 합쳐지지 않으면서, 같은 curl이 매 요청마다
+새 `dlsid`를 발급받는 session churn은 계속 탐지할 수 있습니다.
+
+```bash
+curl http://localhost:8080/__detection/api/actors
+curl http://localhost:8080/__detection/api/actors/<actorId>
+curl http://localhost:8080/__detection/api/actors/<actorId>/path
+```
+
+차단 모드에서는 Session 점수와 Client Actor 점수 중 높은 값을 사용합니다.
 
 > 참고: 로그인 폼 등 POST body는 `express.json()`/`urlencoded()`로 한 번 파싱한 뒤
 > `fixRequestBody()`로 다시 스트림에 실어 juice-shop으로 정상 전달합니다(그래야 로그인 등

@@ -8,7 +8,12 @@ const {
 const { v4: uuidv4 } = require("uuid");
 
 const store = require("./lib/sessionStore");
-const { extractFeatures } = require("./lib/featureExtractor");
+const { deriveAuthGroupId } = require("./lib/authGroup");
+const {
+  extractFeatures,
+  extractActorFeatures,
+  extractAuthGroupFeatures,
+} = require("./lib/featureExtractor");
 const { classify } = require("./lib/classifier");
 const { tagPayload } = require("./lib/payloadSignatures");
 
@@ -60,11 +65,11 @@ app.post("/__detection/telemetry", (req, res) => {
 
 app.get("/__detection/api/sessions", (req, res) => {
   const result = store.getAllSessions().map((s) => {
-    const ipEntry = store.getIpEntry(s.ip);
-    const features = extractFeatures(s, ipEntry);
+    const features = extractFeatures(s);
     const { score, label, breakdown } = classify(features);
     return {
       sessionId: s.id,
+      actorId: s.actorId,
       ip: s.ip,
       score,
       label,
@@ -80,10 +85,9 @@ app.get("/__detection/api/sessions", (req, res) => {
 app.get("/__detection/api/sessions/:id", (req, res) => {
   const s = store.getSession(req.params.id);
   if (!s) return res.status(404).json({ error: "not found" });
-  const ipEntry = store.getIpEntry(s.ip);
-  const features = extractFeatures(s, ipEntry);
+  const features = extractFeatures(s);
   const verdict = classify(features);
-  res.json({ sessionId: s.id, ip: s.ip, ...verdict, features });
+  res.json({ sessionId: s.id, actorId: s.actorId, ip: s.ip, ...verdict, features });
 });
 
 // 세션의 공격 경로 = 시간순 요청 타임라인 (url, method, status, body, 시그니처 태그)
@@ -98,14 +102,117 @@ app.get("/__detection/api/sessions/:id/path", (req, res) => {
   });
 });
 
+app.get("/__detection/api/actors", (req, res) => {
+  const result = store.getAllActors().map((actor) => {
+    const features = extractActorFeatures(actor, store.getSession);
+    const { score, label, breakdown } = classify(features);
+    return {
+      actorId: actor.id,
+      ip: actor.ip,
+      fingerprint: actor.fingerprint,
+      score,
+      label,
+      breakdown,
+      features,
+      totalRequests: actor.totalRequests,
+      sessionCount: actor.sessionIds.size,
+      firstSeen: actor.firstSeen,
+      lastSeen: actor.lastSeen,
+    };
+  });
+  res.json(result);
+});
+
+app.get("/__detection/api/actors/:id", (req, res) => {
+  const actor = store.getActor(req.params.id);
+  if (!actor) return res.status(404).json({ error: "not found" });
+  const features = extractActorFeatures(actor, store.getSession);
+  const verdict = classify(features);
+  res.json({
+    actorId: actor.id,
+    ip: actor.ip,
+    fingerprint: actor.fingerprint,
+    ...verdict,
+    features,
+    firstSeen: actor.firstSeen,
+    lastSeen: actor.lastSeen,
+    totalRequests: actor.totalRequests,
+    sessionCount: actor.sessionIds.size,
+    sessionIds: Array.from(actor.sessionIds),
+    requests: [...actor.requests].sort((a, b) => a.ts - b.ts),
+  });
+});
+
+app.get("/__detection/api/actors/:id/path", (req, res) => {
+  const actor = store.getActor(req.params.id);
+  if (!actor) return res.status(404).json({ error: "not found" });
+  res.json({
+    actorId: actor.id,
+    ip: actor.ip,
+    fingerprint: actor.fingerprint,
+    sessionCount: actor.sessionIds.size,
+    sessionIds: Array.from(actor.sessionIds),
+    requests: [...actor.requests].sort((a, b) => a.ts - b.ts),
+  });
+});
+
+app.get("/__detection/api/auth-groups", (req, res) => {
+  const result = store.getAllAuthGroups().map((group) => {
+    const features = extractAuthGroupFeatures(group, store.getSession);
+    const { score, label, breakdown } = classify(features);
+    return {
+      authGroupId: group.id,
+      score,
+      label,
+      breakdown,
+      features,
+      totalRequests: group.totalRequests,
+      sessionCount: group.sessionIds.size,
+      firstSeen: group.firstSeen,
+      lastSeen: group.lastSeen,
+    };
+  });
+  res.json(result);
+});
+
+app.get("/__detection/api/auth-groups/:id", (req, res) => {
+  const group = store.getAuthGroup(req.params.id);
+  if (!group) return res.status(404).json({ error: "not found" });
+  const features = extractAuthGroupFeatures(group, store.getSession);
+  const verdict = classify(features);
+  res.json({
+    authGroupId: group.id,
+    ...verdict,
+    features,
+    firstSeen: group.firstSeen,
+    lastSeen: group.lastSeen,
+    totalRequests: group.totalRequests,
+    sessionCount: group.sessionIds.size,
+    sessionIds: Array.from(group.sessionIds),
+    requests: [...group.requests].sort((a, b) => a.ts - b.ts),
+  });
+});
+
+// Auth Group의 공격 경로 = 동일 Bearer token을 쓴 모든 세션의 시간순 요청 타임라인
+app.get("/__detection/api/auth-groups/:id/path", (req, res) => {
+  const group = store.getAuthGroup(req.params.id);
+  if (!group) return res.status(404).json({ error: "not found" });
+  res.json({
+    authGroupId: group.id,
+    sessionCount: group.sessionIds.size,
+    sessionIds: Array.from(group.sessionIds),
+    requests: [...group.requests].sort((a, b) => a.ts - b.ts),
+  });
+});
+
 // 리포트용 전체 export (세션 1개 또는 전체)
 app.get("/__detection/api/export", (req, res) => {
   const result = store.getAllSessions().map((s) => {
-    const ipEntry = store.getIpEntry(s.ip);
-    const features = extractFeatures(s, ipEntry);
+    const features = extractFeatures(s);
     const verdict = classify(features);
     return {
       sessionId: s.id,
+      actorId: s.actorId,
       ip: s.ip,
       userAgent: s.userAgent,
       firstSeen: s.firstSeen,
@@ -128,6 +235,9 @@ app.use(
     selfHandleResponse: true,
     onProxyReq: (proxyReq, req) => {
       req._detectionStart = Date.now();
+      // raw Bearer token은 이 시점에만 읽고, 이후에는 단방향 hash ID만 전달한다.
+      req.authGroupId = deriveAuthGroupId(req.headers.authorization);
+      req.detectionHeaders = store.withoutAuthorizationHeaders(req.headers);
       // express.json()/urlencoded()가 body를 이미 읽어버렸다면 juice-shop으로 다시 실어준다.
       // (안 해주면 로그인/주문 등 POST 요청 body가 juice-shop에 도달하지 않는다)
       fixRequestBody(proxyReq, req);
@@ -139,21 +249,33 @@ app.use(
         method: req.method,
         url: req.originalUrl,
         status: proxyRes.statusCode,
-        headers: req.headers,
+        headers: req.detectionHeaders,
         body: req.body,
         tags,
+        authGroupId: req.authGroupId,
       });
 
       // BLOCK_MODE: 임계치 이상이면 실제 응답 대신 403 반환
       if (BLOCK_MODE) {
-        const ipEntry = store.getIpEntry(ip);
-        const features = extractFeatures(session, ipEntry);
-        const { score, label } = classify(features);
+        const sessionVerdict = classify(extractFeatures(session));
+        const actorId = store.deriveActorId(ip, store.headerFingerprint(req.detectionHeaders));
+        const actor = store.getActor(actorId);
+        const actorVerdict = actor
+          ? classify(extractActorFeatures(actor, store.getSession))
+          : sessionVerdict;
+        const source = actorVerdict.score > sessionVerdict.score ? "actor" : "session";
+        const { score, label } = source === "actor" ? actorVerdict : sessionVerdict;
         if (score >= BLOCK_THRESHOLD) {
           res.statusCode = 403;
           res.setHeader("Content-Type", "application/json");
           return Buffer.from(
-            JSON.stringify({ blocked: true, reason: "ai-attacker-detected", score, label })
+            JSON.stringify({
+              blocked: true,
+              reason: "ai-attacker-detected",
+              source,
+              score,
+              label,
+            })
           );
         }
       }

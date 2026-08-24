@@ -6,6 +6,7 @@
 <style>
   body { font-family: -apple-system, Arial, sans-serif; background:#0f1117; color:#e5e7eb; margin:0; padding:24px; }
   h1 { font-size:20px; margin-bottom:4px; }
+  h2 { font-size:16px; margin-top:28px; margin-bottom:4px; }
   p.sub { color:#9ca3af; margin-top:0; font-size:13px; }
   table { width:100%; border-collapse:collapse; margin-top:16px; font-size:13px; }
   th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #262a35; }
@@ -41,6 +42,8 @@
   <div class="toolbar">
     <a href="/__detection/api/export" target="_blank">⬇ 전체 로그 export (JSON)</a>
   </div>
+  <h2>Sessions</h2>
+  <p class="sub">dlsid 쿠키 기준 · 요청 수와 행동 feature는 해당 세션 데이터만 사용</p>
   <table>
     <thead>
       <tr>
@@ -50,6 +53,30 @@
       </tr>
     </thead>
     <tbody id="rows"></tbody>
+  </table>
+
+  <h2>Client Actors</h2>
+  <p class="sub">IP + User-Agent/브라우저 헤더 fingerprint 기준 · 쿠키가 바뀌어도 같은 클라이언트 흐름으로 집계</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Actor</th><th>IP</th><th>Fingerprint</th><th>Score</th><th>Label</th>
+        <th>Request Count</th><th>Session Count</th><th>First Seen</th><th>Last Seen</th>
+      </tr>
+    </thead>
+    <tbody id="actorRows"></tbody>
+  </table>
+
+  <h2>Auth Groups</h2>
+  <p class="sub">동일한 Authorization Bearer Token의 SHA-256 hash 기준 그룹</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Auth Group</th><th>Score</th><th>Label</th><th>Request Count</th><th>Session Count</th>
+        <th>First Seen</th><th>Last Seen</th>
+      </tr>
+    </thead>
+    <tbody id="authGroupRows"></tbody>
   </table>
 
   <div class="modal-backdrop" id="backdrop" onclick="closeModal(event)">
@@ -65,8 +92,14 @@
 let pollTimer = null;
 
 async function refresh() {
-  const res = await fetch('/__detection/api/sessions');
-  const data = await res.json();
+  const [sessionRes, actorRes, authGroupRes] = await Promise.all([
+    fetch('/__detection/api/sessions'),
+    fetch('/__detection/api/actors'),
+    fetch('/__detection/api/auth-groups')
+  ]);
+  const data = await sessionRes.json();
+  const actors = await actorRes.json();
+  const authGroups = await authGroupRes.json();
   const rows = document.getElementById('rows');
   rows.innerHTML = data
     .sort((a,b) => b.score - a.score)
@@ -90,6 +123,42 @@ async function refresh() {
         <td>${s.features.domEventDiversity}</td>
       </tr>
     `).join('');
+
+  document.getElementById('actorRows').innerHTML = actors
+    .sort((a,b) => b.score - a.score)
+    .map(actor => `
+      <tr class="session-row" onclick="openActorPath('${actor.actorId}')">
+        <td><code>${actor.actorId.slice(0,18)}…</code></td>
+        <td>${actor.ip}</td>
+        <td><code>${actor.fingerprint}</code></td>
+        <td>
+          <span class="score-bar"><span class="score-fill" style="width:${Math.round(actor.score*100)}%"></span></span>
+          ${(actor.score*100).toFixed(0)}%
+        </td>
+        <td><span class="badge ${actor.label}">${actor.label}</span></td>
+        <td>${actor.totalRequests}</td>
+        <td>${actor.sessionCount}</td>
+        <td>${new Date(actor.firstSeen).toLocaleString()}</td>
+        <td>${new Date(actor.lastSeen).toLocaleString()}</td>
+      </tr>
+    `).join('');
+
+  document.getElementById('authGroupRows').innerHTML = authGroups
+    .sort((a,b) => b.score - a.score)
+    .map(group => `
+      <tr class="session-row" onclick="openAuthGroupPath('${group.authGroupId}')">
+        <td><code>${group.authGroupId.slice(0,17)}…</code></td>
+        <td>
+          <span class="score-bar"><span class="score-fill" style="width:${Math.round(group.score*100)}%"></span></span>
+          ${(group.score*100).toFixed(0)}%
+        </td>
+        <td><span class="badge ${group.label}">${group.label}</span></td>
+        <td>${group.totalRequests}</td>
+        <td>${group.sessionCount}</td>
+        <td>${new Date(group.firstSeen).toLocaleString()}</td>
+        <td>${new Date(group.lastSeen).toLocaleString()}</td>
+      </tr>
+    `).join('');
 }
 
 function statusClass(status) {
@@ -110,6 +179,52 @@ async function openPath(sessionId) {
     <div class="path-item">
       <div class="meta">#${i+1} · ${new Date(r.ts).toLocaleTimeString()} · ${r.method}
         <span class="${statusClass(r.status)}">${r.status}</span>
+        ${(r.tags||[]).map(t => `<span class="tag">${t}</span>`).join('')}
+      </div>
+      <div class="url">${r.url}</div>
+      ${r.body ? `<div class="body">body: ${typeof r.body === 'string' ? r.body : JSON.stringify(r.body)}</div>` : ''}
+    </div>
+  `).join('') || '<p>기록된 요청이 없습니다.</p>';
+  document.getElementById('backdrop').style.display = 'block';
+}
+
+async function openActorPath(actorId) {
+  clearInterval(pollTimer);
+  const encodedId = encodeURIComponent(actorId);
+  const res = await fetch(`/__detection/api/actors/${encodedId}/path`);
+  const data = await res.json();
+  document.getElementById('modalTitle').textContent =
+    `Actor 공격 경로 — ${actorId.slice(0,18)}… · ${data.sessionCount}개 세션 · ${data.requests.length}개 요청`;
+  document.getElementById('modalExport').innerHTML =
+    `<a href="/__detection/api/actors/${encodedId}/path" target="_blank">⬇ 이 Actor 로그 export (JSON)</a>`;
+  document.getElementById('pathList').innerHTML = data.requests.map((r, i) => `
+    <div class="path-item">
+      <div class="meta">#${i+1} · ${new Date(r.ts).toLocaleTimeString()} · ${r.method}
+        <span class="${statusClass(r.status)}">${r.status}</span>
+        · session <code>${r.sessionId.slice(0,8)}</code>
+        ${(r.tags||[]).map(t => `<span class="tag">${t}</span>`).join('')}
+      </div>
+      <div class="url">${r.url}</div>
+      ${r.body ? `<div class="body">body: ${typeof r.body === 'string' ? r.body : JSON.stringify(r.body)}</div>` : ''}
+    </div>
+  `).join('') || '<p>기록된 요청이 없습니다.</p>';
+  document.getElementById('backdrop').style.display = 'block';
+}
+
+async function openAuthGroupPath(authGroupId) {
+  clearInterval(pollTimer);
+  const encodedId = encodeURIComponent(authGroupId);
+  const res = await fetch(`/__detection/api/auth-groups/${encodedId}/path`);
+  const data = await res.json();
+  document.getElementById('modalTitle').textContent =
+    `Auth Group 공격 경로 — ${authGroupId.slice(0,17)}… · ${data.sessionCount}개 세션 · ${data.requests.length}개 요청`;
+  document.getElementById('modalExport').innerHTML =
+    `<a href="/__detection/api/auth-groups/${encodedId}/path" target="_blank">⬇ 이 Auth Group 로그 export (JSON)</a>`;
+  document.getElementById('pathList').innerHTML = data.requests.map((r, i) => `
+    <div class="path-item">
+      <div class="meta">#${i+1} · ${new Date(r.ts).toLocaleTimeString()} · ${r.method}
+        <span class="${statusClass(r.status)}">${r.status}</span>
+        · session <code>${r.sessionId.slice(0,8)}</code>
         ${(r.tags||[]).map(t => `<span class="tag">${t}</span>`).join('')}
       </div>
       <div class="url">${r.url}</div>

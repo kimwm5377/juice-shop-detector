@@ -26,19 +26,16 @@ function maxBurst(timestamps, windowMs = 2000) {
   return maxCount;
 }
 
-/**
- * 세션 원시 데이터에서 탐지용 feature를 계산한다.
- */
-function extractFeatures(session, ipEntry) {
-  // 볼륨/행동 feature는 "행위자(IP) 단위"로 계산한다.
-  // 공격자가 세션 쿠키를 보존하지 않고 요청을 흩뿌리면 session.requests 는 1개씩이라
-  // 축적형 신호가 전부 죽는다. IP에 모인 전체 요청 스트림이 있으면 그것을 사용해
-  // churn을 오히려 탐지 신호로 활용한다. (telemetry 는 세션 단위 그대로 사용)
-  const actorRequests =
-    ipEntry && ipEntry.requests && ipEntry.requests.length > session.requests.length
-      ? ipEntry.requests
-      : session.requests;
-  const requests = actorRequests;
+function extractStreamFeatures({
+  requests,
+  headerSample,
+  fingerprint,
+  userAgent,
+  telemetry,
+  firstSeen,
+  lastSeen,
+  sessionChurn,
+}) {
   const timestamps = requests.map((r) => r.ts);
   const intervals = [];
   for (let i = 1; i < timestamps.length; i++) {
@@ -57,23 +54,18 @@ function extractFeatures(session, ipEntry) {
 
   const burstLength = maxBurst(timestamps);
 
-  const headers = session.headerSample || {};
-  const ua = session.userAgent || "";
+  const headers = headerSample || {};
+  const ua = userAgent || "";
   const automationUA = isAutomationUA(ua);
   const missingHeaders = missingBrowserHeaders(headers);
 
-  const sessionChurn = ipEntry ? ipEntry.sessionIds.size : 1;
-
-  const t = session.telemetry;
+  const t = telemetry;
   const mouseMoveCount = t.mouseMoveCount;
   const scrollCount = t.scrollCount;
   const domEventDiversity = t.domEventTypes.size;
   const hasTelemetry = t.lastTelemetryAt !== null;
 
-  // 페이로드 시그니처는 "세션 자기 요청"에서만 집계한다.
-  // (IP 집계로 하면 같은 IP 뒤의 무고한 사용자가 공격자의 시그니처를 물려받아 오탐이 난다 - NAT/공유IP 문제)
-  // 공격자는 세션을 흩뿌려도 각 요청에 자기 공격 페이로드를 담으므로 세션 단위로도 개별 탐지된다.
-  const allTags = session.requests.flatMap((r) => r.tags || []);
+  const allTags = requests.flatMap((r) => r.tags || []);
   const attackSignatureHits = allTags.length;
   const attackCategories = Array.from(new Set(allTags));
   const distinctAttackCategories = attackCategories.length;
@@ -92,14 +84,104 @@ function extractFeatures(session, ipEntry) {
     missingHeaderCount: missingHeaders.length,
     missingHeaders,
     userAgent: ua,
-    fingerprint: session.fingerprint,
+    fingerprint,
     sessionChurn,
     mouseMoveCount,
     scrollCount,
     domEventDiversity,
     hasTelemetry,
-    sessionDurationMs: session.lastSeen - session.firstSeen,
+    sessionDurationMs: lastSeen - firstSeen,
   };
 }
 
-module.exports = { extractFeatures, mean, stdev, maxBurst };
+/**
+ * dlsid 세션 자체 요청과 텔레메트리만으로 feature를 계산한다.
+ */
+function extractFeatures(session) {
+  return extractStreamFeatures({
+    requests: session.requests,
+    headerSample: session.headerSample,
+    fingerprint: session.fingerprint,
+    userAgent: session.userAgent,
+    telemetry: session.telemetry,
+    firstSeen: session.firstSeen,
+    lastSeen: session.lastSeen,
+    sessionChurn: 1,
+  });
+}
+
+function aggregateTelemetry(memberSessions) {
+  return memberSessions.reduce(
+    (result, session) => {
+      result.mouseMoveCount += session.telemetry.mouseMoveCount;
+      result.scrollCount += session.telemetry.scrollCount;
+      session.telemetry.domEventTypes.forEach((eventType) => result.domEventTypes.add(eventType));
+      result.pageLoads += session.telemetry.pageLoads;
+      if (session.telemetry.lastTelemetryAt !== null) {
+        result.lastTelemetryAt = Math.max(
+          result.lastTelemetryAt || 0,
+          session.telemetry.lastTelemetryAt
+        );
+      }
+      return result;
+    },
+    {
+      mouseMoveCount: 0,
+      scrollCount: 0,
+      domEventTypes: new Set(),
+      pageLoads: 0,
+      lastTelemetryAt: null,
+    }
+  );
+}
+
+/**
+ * 동일 IP + 헤더 fingerprint Actor의 요청과 텔레메트리를 합친다.
+ */
+function extractActorFeatures(actor, getSession) {
+  const memberSessions = Array.from(actor.sessionIds, (sessionId) => getSession(sessionId)).filter(
+    Boolean
+  );
+  return extractStreamFeatures({
+    requests: [...actor.requests].sort((a, b) => a.ts - b.ts),
+    headerSample: actor.headerSample,
+    fingerprint: actor.fingerprint,
+    userAgent: actor.userAgent,
+    telemetry: aggregateTelemetry(memberSessions),
+    firstSeen: actor.firstSeen,
+    lastSeen: actor.lastSeen,
+    sessionChurn: actor.sessionIds.size,
+  });
+}
+
+/**
+ * Auth Group에 속한 요청과 세션 텔레메트리를 하나의 행위자 흐름으로 합친다.
+ * raw Authorization 값은 사용하지 않고, 이미 hash된 group 데이터만 분석한다.
+ */
+function extractAuthGroupFeatures(group, getSession) {
+  const memberSessions = Array.from(group.sessionIds, (sessionId) => getSession(sessionId)).filter(
+    Boolean
+  );
+  const representative = memberSessions.find((session) => session.headerSample) || memberSessions[0];
+
+  const requests = [...group.requests].sort((a, b) => a.ts - b.ts);
+  return extractStreamFeatures({
+    requests,
+    headerSample: representative ? representative.headerSample : null,
+    fingerprint: representative ? representative.fingerprint : null,
+    userAgent: representative ? representative.userAgent : "",
+    telemetry: aggregateTelemetry(memberSessions),
+    firstSeen: group.firstSeen,
+    lastSeen: group.lastSeen,
+    sessionChurn: group.sessionIds.size,
+  });
+}
+
+module.exports = {
+  extractFeatures,
+  extractActorFeatures,
+  extractAuthGroupFeatures,
+  mean,
+  stdev,
+  maxBurst,
+};
