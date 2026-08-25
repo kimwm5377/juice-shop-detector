@@ -1,7 +1,7 @@
 {
   "name": "juice-shop-detection-proxy",
   "version": "1.0.0",
-  "description": "AI/bot attacker detection reverse proxy in front of OWASP Juice Shop",
+  "description": "Automation and attack behavior detection proxy for OWASP Juice Shop",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

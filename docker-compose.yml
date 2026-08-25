@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   juice-shop:
     image: bkimminich/juice-shop
@@ -17,9 +15,11 @@ services:
     environment:
       - JUICE_SHOP_URL=http://juice-shop:3000
       - PORT=8080
-      # true 로 바꾸면 고위험 세션 요청을 자동 차단(403)합니다. 기본은 탐지/로깅만 수행.
+      # 현재 버전은 true여도 탐지 결과만 기록하는 log-only 모드입니다.
       - BLOCK_MODE=false
       - BLOCK_THRESHOLD=0.75
+      - ENABLE_EXPERIMENT_RUN_ID=false
+      - PAYLOAD_FINGERPRINT_KEY=${PAYLOAD_FINGERPRINT_KEY:-}
     depends_on:
       - juice-shop
     networks:

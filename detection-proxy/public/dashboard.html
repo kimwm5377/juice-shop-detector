@@ -1,246 +1,468 @@
 <!DOCTYPE html>
-<html lang="ko">
+<html lang="ko" data-theme="dark">
 <head>
 <meta charset="UTF-8" />
-<title>AI Attacker Detection Dashboard</title>
+<!-- 대시보드 새로고침 시 브라우저가 /favicon.ico를 Juice Shop 요청으로 만들지 않게 한다. -->
+<link rel="icon" href="data:," />
+<title>Traffic Detection Dashboard</title>
 <style>
-  body { font-family: -apple-system, Arial, sans-serif; background:#0f1117; color:#e5e7eb; margin:0; padding:24px; }
-  h1 { font-size:20px; margin-bottom:4px; }
-  h2 { font-size:16px; margin-top:28px; margin-bottom:4px; }
-  p.sub { color:#9ca3af; margin-top:0; font-size:13px; }
-  table { width:100%; border-collapse:collapse; margin-top:16px; font-size:13px; }
-  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #262a35; }
-  th { color:#9ca3af; font-weight:600; position:sticky; top:0; background:#0f1117; }
-  tr:hover { background:#171a23; }
-  .badge { padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; }
-  .human { background:#14532d; color:#86efac; }
-  .suspicious { background:#78350f; color:#fdba74; }
-  .likely-ai-bot { background:#7f1d1d; color:#fca5a5; }
-  .score-bar { background:#1f2330; border-radius:4px; overflow:hidden; width:100px; height:8px; display:inline-block; vertical-align:middle; margin-right:6px; }
-  .score-fill { height:100%; background:linear-gradient(90deg,#22c55e,#eab308,#ef4444); }
-  code { color:#93c5fd; }
-  tr.session-row { cursor:pointer; }
-  .toolbar { margin-top:12px; }
-  .toolbar a { color:#93c5fd; font-size:13px; text-decoration:none; margin-right:16px; }
-  .toolbar a:hover { text-decoration:underline; }
-  .modal-backdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:10; }
-  .modal { position:fixed; top:5%; left:50%; transform:translateX(-50%); width:min(900px,92vw); max-height:88vh; overflow:auto; background:#131722; border:1px solid #262a35; border-radius:10px; padding:20px; z-index:11; }
-  .modal h2 { margin-top:0; font-size:16px; }
-  .modal .close { float:right; cursor:pointer; color:#9ca3af; }
-  .path-item { border-left:2px solid #262a35; padding:8px 0 8px 12px; margin-bottom:4px; font-size:12px; }
-  .path-item .meta { color:#9ca3af; }
-  .path-item .url { color:#e5e7eb; font-weight:600; }
-  .path-item .status-404 { color:#fca5a5; }
-  .path-item .status-2xx { color:#86efac; }
-  .path-item .body { color:#93c5fd; margin-top:2px; word-break:break-all; }
-  .tag { display:inline-block; background:#7f1d1d; color:#fca5a5; font-size:10px; padding:1px 6px; border-radius:999px; margin-left:6px; }
+  :root {
+    color-scheme:light;
+    --bg:#f4f6f8; --surface:#ffffff; --surface-muted:#f8f9fb;
+    --border:#d9dee5; --border-strong:#c3cad3; --text:#1f2933; --muted:#66717f;
+    --navy:#243b53; --blue:#2f6f9f; --amber:#a15c00; --red:#b42318;
+    --green:#20744a; --hover:#f2f5f8;
+  }
+  html[data-theme="dark"] {
+    color-scheme:dark;
+    --bg:#11161c; --surface:#171d24; --surface-muted:#1c232b;
+    --border:#303943; --border-strong:#46515d; --text:#dce2e8; --muted:#96a1ac;
+    --navy:#c9d5df; --blue:#7da6c4; --amber:#d79a4b; --red:#e0736b;
+    --green:#72bd91; --hover:#202832;
+  }
+  * { box-sizing:border-box; }
+  body { font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); margin:0; font-size:14px; }
+  button,a { font:inherit; }
+  code { font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace; color:var(--blue); font-size:.92em; }
+  .app-header { background:var(--surface); border-bottom:1px solid var(--border); }
+  .header-inner,.page { width:min(1440px,calc(100% - 48px)); margin:0 auto; }
+  .header-inner { min-height:78px; display:flex; align-items:center; justify-content:space-between; gap:24px; }
+  .product-label { margin:0 0 3px; color:var(--muted); font-size:11px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; }
+  h1 { margin:0; color:var(--text); font-size:21px; line-height:1.3; font-weight:650; }
+  .header-actions { display:flex; align-items:center; gap:18px; }
+  .refresh-note { color:var(--muted); font-size:12px; white-space:nowrap; }
+  .header-button,.export-link { color:var(--navy); font-size:13px; font-weight:600; text-decoration:none; padding:8px 11px; border:1px solid var(--border-strong); background:var(--surface); }
+  .header-button { cursor:pointer; min-width:112px; }
+  .header-button:hover,
+  .export-link:hover { background:var(--hover); }
+  .page { padding:24px 0 40px; }
+  .notice { margin:0 0 18px; padding:10px 12px; border-left:3px solid #607d98; background:var(--surface-muted); color:var(--muted); font-size:13px; line-height:1.5; }
+  .summary-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); border:1px solid var(--border); background:var(--surface); margin-bottom:22px; }
+  .summary-item { min-height:82px; padding:15px 18px; border-right:1px solid var(--border); }
+  .summary-item:last-child { border-right:0; }
+  .summary-label { display:block; color:var(--muted); font-size:12px; font-weight:600; margin-bottom:8px; }
+  .summary-value { display:block; color:var(--text); font-size:24px; line-height:1; font-weight:650; font-variant-numeric:tabular-nums; }
+  .workspace { border:1px solid var(--border); background:var(--surface); }
+  .tabs { display:flex; overflow-x:auto; border-bottom:1px solid var(--border); background:var(--surface-muted); }
+  .tab-button { position:relative; appearance:none; border:0; border-right:1px solid var(--border); background:transparent; color:#52606d; padding:14px 18px; cursor:pointer; white-space:nowrap; font-size:13px; font-weight:600; }
+  .tab-button:hover { background:var(--hover); color:var(--text); }
+  .tab-button.active { background:var(--surface); color:var(--text); }
+  .tab-button.active::after { content:""; position:absolute; left:0; right:0; bottom:-1px; height:2px; background:#315f7d; }
+  .tab-count { margin-left:7px; color:var(--muted); font-size:11px; font-variant-numeric:tabular-nums; }
+  .tab-panel { display:none; }
+  .tab-panel.active { display:block; }
+  .section-head { display:flex; justify-content:space-between; align-items:flex-start; gap:20px; padding:20px 20px 14px; }
+  h2 { margin:0; color:var(--text); font-size:16px; line-height:1.4; font-weight:650; }
+  h3 { margin:24px 0 10px; color:var(--text); font-size:13px; font-weight:700; }
+  .sub { color:var(--muted); margin:5px 0 0; font-size:12px; line-height:1.5; }
+  .observation { display:inline-block; margin-left:7px; color:#525f6d; font-size:10px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; border:1px solid var(--border-strong); padding:2px 6px; vertical-align:2px; }
+  .table-wrap { width:100%; overflow:auto; border-top:1px solid var(--border); }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { text-align:left; padding:11px 13px; border-bottom:1px solid var(--border); white-space:nowrap; }
+  th { color:#52606d; background:var(--surface-muted); font-size:11px; font-weight:700; letter-spacing:.01em; }
+  tbody tr:last-child td { border-bottom:0; }
+  tr.clickable { cursor:pointer; }
+  tr.clickable:hover { background:var(--hover); }
+  .score { display:inline-flex; align-items:center; gap:8px; min-width:102px; font-variant-numeric:tabular-nums; font-weight:650; }
+  .score-bar { background:var(--border); overflow:hidden; width:68px; height:6px; display:inline-block; }
+  .score-fill { display:block; height:100%; }
+  .score-fill.automation { background:#b06b16; }
+  .score-fill.attack { background:#b83a32; }
+  .modal-backdrop { display:none; position:fixed; inset:0; background:rgba(30,39,48,.55); z-index:10; padding:24px; }
+  .modal { width:min(1120px,100%); max-height:calc(100vh - 48px); overflow:auto; margin:0 auto; background:var(--surface); border:1px solid var(--border-strong); box-shadow:0 12px 36px rgba(0,0,0,.28); }
+  .modal-header { position:sticky; top:0; z-index:2; display:flex; justify-content:space-between; align-items:flex-start; gap:20px; padding:18px 22px; border-bottom:1px solid var(--border); background:var(--surface); }
+  .modal-header h2 { word-break:break-all; }
+  .modal-actions { display:flex; align-items:center; gap:14px; flex-shrink:0; }
+  .modal-actions .toolbar { margin:0; }
+  .modal-actions a { color:var(--blue); text-decoration:none; font-size:12px; }
+  .close { appearance:none; border:1px solid var(--border-strong); background:var(--surface); color:var(--text); padding:6px 10px; cursor:pointer; font-size:12px; }
+  .close:hover { background:var(--hover); }
+  #detailContent { padding:22px; }
+  .score-grid,.feature-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; margin-bottom:18px; }
+  .feature-grid { grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); }
+  .panel { border:1px solid var(--border); background:var(--surface); padding:14px 15px; margin-bottom:14px; }
+  .panel h3 { margin:0 0 10px; padding-bottom:9px; border-bottom:1px solid var(--border); color:var(--text); }
+  .metric { display:flex; justify-content:space-between; gap:20px; padding:6px 0; font-size:12px; border-bottom:1px solid var(--border); }
+  .metric:last-child { border-bottom:0; }
+  .metric .key { color:#5d6875; word-break:break-word; }
+  .metric .value { color:var(--text); text-align:right; word-break:break-word; font-variant-numeric:tabular-nums; }
+  .section-title { margin:24px 0 10px; padding-bottom:8px; border-bottom:1px solid var(--border); }
+  .sequence { margin:0; padding-left:24px; font-size:12px; }
+  .sequence li { padding:4px 0; }
+  .path-item { border-left:2px solid #b9c3cc; padding:7px 0 9px 13px; margin:0 0 7px; font-size:12px; }
+  .path-item .meta { color:#6b7682; }
+  .path-item .url { color:var(--text); font-weight:600; word-break:break-all; }
+  .path-item .operation { color:var(--blue); margin-top:2px; }
+  .path-item .body { color:var(--blue); margin-top:3px; word-break:break-all; }
+  .status-error { color:var(--red); font-weight:700; }
+  .status-success { color:var(--green); font-weight:700; }
+  .tag { display:inline-block; background:#f7e7e5; border:1px solid #e7c3bf; color:#8f2f28; font-size:10px; padding:1px 5px; margin-left:6px; }
+  .empty { color:var(--muted); padding:16px 0; margin:0; }
+  @media (max-width:800px) {
+    .header-inner,.page { width:min(100% - 24px,1440px); }
+    .header-inner { align-items:flex-start; padding:15px 0; }
+    .header-actions { flex-direction:column; align-items:flex-end; gap:8px; }
+    .summary-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .summary-item:nth-child(2) { border-right:0; }
+    .summary-item:nth-child(-n+2) { border-bottom:1px solid var(--border); }
+    .score-grid { grid-template-columns:1fr; }
+    .modal-backdrop { padding:8px; }
+    .modal { max-height:calc(100vh - 16px); }
+    .modal-header { padding:14px; }
+    #detailContent { padding:14px; }
+  }
 </style>
 </head>
 <body>
-  <h1>🕵️ AI Attacker Detection Dashboard</h1>
-  <p class="sub">Juice Shop 앞단 detection-proxy — 2초마다 자동 갱신 · 행을 클릭하면 공격 경로(타임라인)를 볼 수 있습니다</p>
-  <div class="toolbar">
-    <a href="/__detection/api/export" target="_blank">⬇ 전체 로그 export (JSON)</a>
-  </div>
-  <h2>Sessions</h2>
-  <p class="sub">dlsid 쿠키 기준 · 요청 수와 행동 feature는 해당 세션 데이터만 사용</p>
-  <table>
-    <thead>
-      <tr>
-        <th>Session</th><th>IP</th><th>Score</th><th>Label</th>
-        <th>Req#</th><th>AvgInt(ms)</th><th>URLdiv</th><th>404%</th>
-        <th>Burst</th><th>UA/Header</th><th>Mouse</th><th>Scroll</th><th>DOMdiv</th>
-      </tr>
-    </thead>
-    <tbody id="rows"></tbody>
-  </table>
+  <header class="app-header">
+    <div class="header-inner">
+      <div>
+        <p class="product-label">Security Monitoring</p>
+        <h1>Traffic Detection Dashboard</h1>
+      </div>
+      <div class="header-actions">
+        <span class="refresh-note">2초 간격 자동 갱신</span>
+        <button class="header-button" type="button" id="themeToggle" aria-pressed="true">Light Mode (라이트)</button>
+        <a class="export-link" href="/__detection/api/export" target="_blank" rel="noopener noreferrer">Session 로그 내보내기 (JSON)</a>
+      </div>
+    </div>
+  </header>
 
-  <h2>Client Actors</h2>
-  <p class="sub">IP + User-Agent/브라우저 헤더 fingerprint 기준 · 쿠키가 바뀌어도 같은 클라이언트 흐름으로 집계</p>
-  <table>
-    <thead>
-      <tr>
-        <th>Actor</th><th>IP</th><th>Fingerprint</th><th>Score</th><th>Label</th>
-        <th>Request Count</th><th>Session Count</th><th>First Seen</th><th>Last Seen</th>
-      </tr>
-    </thead>
-    <tbody id="actorRows"></tbody>
-  </table>
+  <main class="page">
+    <p class="notice"><strong>판정 기준 안내:</strong> Automation Score(자동화 점수)와 Attack Score(공격 점수)는 확률이 아닌 실험 전 휴리스틱 점수입니다. Agentic Evidence(에이전트 행동 근거)는 점수화하지 않은 관찰값입니다.</p>
 
-  <h2>Auth Groups</h2>
-  <p class="sub">동일한 Authorization Bearer Token의 SHA-256 hash 기준 그룹</p>
-  <table>
-    <thead>
-      <tr>
-        <th>Auth Group</th><th>Score</th><th>Label</th><th>Request Count</th><th>Session Count</th>
-        <th>First Seen</th><th>Last Seen</th>
-      </tr>
-    </thead>
-    <tbody id="authGroupRows"></tbody>
-  </table>
+    <section class="summary-grid" aria-label="트래픽 요약">
+      <div class="summary-item"><span class="summary-label">Sessions (세션)</span><strong class="summary-value" id="summarySessions">—</strong></div>
+      <div class="summary-item"><span class="summary-label">Actor Candidates (행위자 후보)</span><strong class="summary-value" id="summaryActors">—</strong></div>
+      <div class="summary-item"><span class="summary-label">Auth Groups (인증 그룹)</span><strong class="summary-value" id="summaryAuthGroups">—</strong></div>
+      <div class="summary-item"><span class="summary-label">Requests (전체 요청)</span><strong class="summary-value" id="summaryRequests">—</strong></div>
+    </section>
 
-  <div class="modal-backdrop" id="backdrop" onclick="closeModal(event)">
-    <div class="modal" id="modal" onclick="event.stopPropagation()">
-      <span class="close" onclick="closeModal()">✕ 닫기</span>
-      <h2 id="modalTitle">공격 경로</h2>
-      <div class="toolbar" id="modalExport"></div>
-      <div id="pathList"></div>
+    <section class="workspace">
+      <nav class="tabs" role="tablist" aria-label="집계 단위">
+        <button class="tab-button active" type="button" role="tab" aria-selected="true" aria-controls="panel-actors" data-tab="actors">Actor Candidates (행위자 후보)<span class="tab-count" id="actorTabCount">0</span></button>
+        <button class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="panel-sessions" data-tab="sessions">Sessions (세션)<span class="tab-count" id="sessionTabCount">0</span></button>
+        <button class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="panel-auth" data-tab="auth">Auth Groups (인증 그룹)<span class="tab-count" id="authTabCount">0</span></button>
+        <button class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="panel-ip" data-tab="ip">IP Observation (IP 관찰)<span class="tab-count" id="ipTabCount">0</span></button>
+      </nav>
+
+      <div class="tab-panel active" id="panel-actors" role="tabpanel">
+        <div class="section-head"><div><h2>Actor Candidates (행위자 후보)</h2><p class="sub">IP와 HTTP Header Fingerprint로 묶은 추정 클라이언트 흐름이며 실제 사용자 식별자가 아닙니다.</p></div></div>
+        <div class="table-wrap"><table><thead><tr>
+          <th>Actor Candidate (행위자 후보)</th><th>IP</th><th>Fingerprint (지문)</th><th>Automation Score (자동화 점수)</th><th>Attack Score (공격 점수)</th>
+          <th>Requests (요청)</th><th>Sessions (세션)</th><th>Last Seen (최근 관찰)</th>
+        </tr></thead><tbody id="actorRows"></tbody></table></div>
+      </div>
+
+      <div class="tab-panel" id="panel-sessions" role="tabpanel" hidden>
+        <div class="section-head"><div><h2>Sessions (세션)</h2><p class="sub">단일 dlsid 흐름만 표시하며 IP 전체 요청은 섞이지 않습니다.</p></div></div>
+        <div class="table-wrap"><table><thead><tr>
+          <th>Session (세션)</th><th>IP</th><th>Automation Score (자동화 점수)</th><th>Attack Score (공격 점수)</th>
+          <th>Requests (요청)</th><th>Avg Interval (평균 간격, ms)</th><th>2s Max (2초 최대)</th><th>10s Requests (10초 요청)</th><th>404 Ratio (404 비율)</th><th>401/403 Ratio (접근 거부 비율)</th>
+        </tr></thead><tbody id="sessionRows"></tbody></table></div>
+      </div>
+
+      <div class="tab-panel" id="panel-auth" role="tabpanel" hidden>
+        <div class="section-head"><div><h2>Auth Groups (인증 그룹)</h2><p class="sub">동일 Bearer Token의 SHA-256 해시 기준입니다. 인증 토큰 원문은 저장하지 않습니다.</p></div></div>
+        <div class="table-wrap"><table><thead><tr>
+          <th>Auth Group (인증 그룹)</th><th>Automation Score (자동화 점수)</th><th>Attack Score (공격 점수)</th>
+          <th>Requests (요청)</th><th>Sessions (세션)</th><th>Actors (행위자 후보)</th><th>Last Seen (최근 관찰)</th>
+        </tr></thead><tbody id="authRows"></tbody></table></div>
+      </div>
+
+      <div class="tab-panel" id="panel-ip" role="tabpanel" hidden>
+        <div class="section-head"><div><h2>IP Observation (IP 관찰) <span class="observation">Observation only</span></h2><p class="sub">NAT/Docker 환경에서는 여러 클라이언트가 섞일 수 있습니다. IP Entry는 관찰 전용이며 탐지 점수 및 차단 기준에 사용하지 않습니다.</p></div></div>
+        <div class="table-wrap"><table><thead><tr>
+          <th>IP</th><th>Requests (요청)</th><th>Sessions (세션)</th><th>Actor Candidates (행위자 후보)</th><th>Unique Paths (고유 경로)</th><th>Last Seen (최근 관찰)</th>
+        </tr></thead><tbody id="ipRows"></tbody></table></div>
+      </div>
+    </section>
+  </main>
+
+  <div class="modal-backdrop" id="backdrop">
+    <div class="modal" id="modal">
+      <div class="modal-header">
+        <div><p class="product-label">Detection Detail</p><h2 id="modalTitle">상세 분석</h2></div>
+        <div class="modal-actions"><div class="toolbar" id="modalExport"></div><button class="close" type="button" id="closeButton">닫기</button></div>
+      </div>
+      <div id="detailContent"></div>
     </div>
   </div>
 
 <script>
-let pollTimer = null;
+const state = { timer: null, activeTab: 'actors' };
 
-async function refresh() {
-  const [sessionRes, actorRes, authGroupRes] = await Promise.all([
-    fetch('/__detection/api/sessions'),
-    fetch('/__detection/api/actors'),
-    fetch('/__detection/api/auth-groups')
-  ]);
-  const data = await sessionRes.json();
-  const actors = await actorRes.json();
-  const authGroups = await authGroupRes.json();
-  const rows = document.getElementById('rows');
-  rows.innerHTML = data
-    .sort((a,b) => b.score - a.score)
-    .map(s => `
-      <tr class="session-row" onclick="openPath('${s.sessionId}')">
-        <td><code>${s.sessionId.slice(0,8)}</code></td>
-        <td>${s.ip}</td>
-        <td>
-          <span class="score-bar"><span class="score-fill" style="width:${Math.round(s.score*100)}%"></span></span>
-          ${(s.score*100).toFixed(0)}%
-        </td>
-        <td><span class="badge ${s.label}">${s.label}</span></td>
-        <td>${s.features.totalRequests}</td>
-        <td>${s.features.avgIntervalMs.toFixed(0)}</td>
-        <td>${s.features.urlDiversity.toFixed(2)}</td>
-        <td>${(s.features.notFoundRatio*100).toFixed(0)}%</td>
-        <td>${s.features.burstLength}</td>
-        <td title="${s.features.userAgent}">${s.features.automationUA ? '⚠️ automation' : 'ok'} / miss:${s.features.missingHeaderCount}</td>
-        <td>${s.features.mouseMoveCount}</td>
-        <td>${s.features.scrollCount}</td>
-        <td>${s.features.domEventDiversity}</td>
-      </tr>
-    `).join('');
-
-  document.getElementById('actorRows').innerHTML = actors
-    .sort((a,b) => b.score - a.score)
-    .map(actor => `
-      <tr class="session-row" onclick="openActorPath('${actor.actorId}')">
-        <td><code>${actor.actorId.slice(0,18)}…</code></td>
-        <td>${actor.ip}</td>
-        <td><code>${actor.fingerprint}</code></td>
-        <td>
-          <span class="score-bar"><span class="score-fill" style="width:${Math.round(actor.score*100)}%"></span></span>
-          ${(actor.score*100).toFixed(0)}%
-        </td>
-        <td><span class="badge ${actor.label}">${actor.label}</span></td>
-        <td>${actor.totalRequests}</td>
-        <td>${actor.sessionCount}</td>
-        <td>${new Date(actor.firstSeen).toLocaleString()}</td>
-        <td>${new Date(actor.lastSeen).toLocaleString()}</td>
-      </tr>
-    `).join('');
-
-  document.getElementById('authGroupRows').innerHTML = authGroups
-    .sort((a,b) => b.score - a.score)
-    .map(group => `
-      <tr class="session-row" onclick="openAuthGroupPath('${group.authGroupId}')">
-        <td><code>${group.authGroupId.slice(0,17)}…</code></td>
-        <td>
-          <span class="score-bar"><span class="score-fill" style="width:${Math.round(group.score*100)}%"></span></span>
-          ${(group.score*100).toFixed(0)}%
-        </td>
-        <td><span class="badge ${group.label}">${group.label}</span></td>
-        <td>${group.totalRequests}</td>
-        <td>${group.sessionCount}</td>
-        <td>${new Date(group.firstSeen).toLocaleString()}</td>
-        <td>${new Date(group.lastSeen).toLocaleString()}</td>
-      </tr>
-    `).join('');
+function applyTheme(theme) {
+  const dark = theme === 'dark';
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  const button = document.getElementById('themeToggle');
+  button.textContent = dark ? 'Light Mode (라이트)' : 'Dark Mode (다크)';
+  button.setAttribute('aria-pressed', String(dark));
+  button.setAttribute('aria-label', dark ? '라이트 모드로 전환' : '다크 모드로 전환');
 }
 
+function initializeTheme() {
+  let savedTheme = 'dark';
+  try {
+    savedTheme = localStorage.getItem('detection-dashboard-theme') || 'dark';
+  } catch (_) {
+    // 저장소 접근이 제한된 환경에서도 기본 다크 모드로 동작한다.
+  }
+  applyTheme(savedTheme === 'light' ? 'light' : 'dark');
+}
+
+function toggleTheme() {
+  const nextTheme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  applyTheme(nextTheme);
+  try {
+    localStorage.setItem('detection-dashboard-theme', nextTheme);
+  } catch (_) {
+    // 테마 전환 자체는 저장 실패와 무관하게 유지한다.
+  }
+}
+
+const entityLabels = {
+  sessions: 'Session (세션)',
+  actors: 'Actor Candidate (행위자 후보)',
+  'auth-groups': 'Auth Group (인증 그룹)',
+  'ip-entries': 'IP Observation (IP 관찰)'
+};
+
+const metricLabels = {
+  timingRegularity: 'Timing Regularity (요청 시간 규칙성)',
+  requestIntensity: 'Request Intensity (요청 집중도)',
+  repeatedOperation: 'Repeated Operation (반복 작업)',
+  sessionChurn: 'Session Churn (세션 변경)',
+  headerAnomaly: 'Header Anomaly (헤더 이상)',
+  browserInteraction: 'Browser Interaction (브라우저 상호작용)',
+  payloadSignature: 'Payload Signature (공격 페이로드 서명)',
+  notFoundExploration: '404 Exploration (404 탐색)',
+  accessDeniedExploration: 'Access Denied Exploration (접근 거부 탐색)',
+  timingSampleSize: 'Timing Sample Size (시간 표본 수)',
+  avgIntervalMs: 'Average Interval (평균 요청 간격, ms)',
+  intervalStdevMs: 'Interval Standard Deviation (간격 표준편차, ms)',
+  intervalCV: 'Interval CV (요청 간격 변동계수)',
+  maxRequests2s: 'Max Requests / 2s (2초 최대 요청)',
+  requests10s: 'Requests / 10s (10초 요청)',
+  repeatSampleSize: 'Repeat Sample Size (반복 표본 수)',
+  repeatRatio: 'Repeat Ratio (동일 작업 반복 비율)',
+  maxConsecutiveRepeats: 'Max Consecutive Repeats (최대 연속 반복)',
+  diversitySampleSize: 'Diversity Sample Size (경로 다양성 표본 수)',
+  uniqueNormalizedPaths: 'Unique Normalized Paths (고유 정규화 경로)',
+  pathDiversity: 'Path Diversity (경로 다양성)',
+  sampleSize: 'Sample Size (표본 수)',
+  notFoundCount: '404 Count (404 응답 수)',
+  notFoundRatio: '404 Ratio (404 응답 비율)',
+  accessDeniedCount: '401/403 Count (접근 거부 응답 수)',
+  accessDeniedRatio: '401/403 Ratio (접근 거부 응답 비율)',
+  statusCounts: 'Status Counts (상태 코드별 수)',
+  headerObservationAvailable: 'Header Observation Available (헤더 관찰 가능)',
+  automationUA: 'Automation User-Agent (자동화 UA)',
+  missingHeaderCount: 'Missing Header Count (누락 헤더 수)',
+  missingHeaders: 'Missing Headers (누락 헤더)',
+  mouseMoveCount: 'Mouse Movement (마우스 이동)',
+  scrollCount: 'Scroll (스크롤)',
+  domEventDiversity: 'DOM Event Diversity (DOM 이벤트 다양성)',
+  pageLoads: 'Page Loads (페이지 로드)',
+  hasTelemetry: 'Telemetry Available (텔레메트리 수집)',
+  payloadSignatureHits: 'Payload Signature Hits (공격 서명 탐지 수)',
+  distinctPayloadCategories: 'Distinct Payload Categories (공격 유형 수)',
+  payloadCategories: 'Payload Categories (공격 유형)',
+  errorToEndpointChangeCount: 'Error → Endpoint Change (오류 후 엔드포인트 변경)',
+  errorToMethodChangeCount: 'Error → Method Change (오류 후 메서드 변경)',
+  retryWithPayloadChangeCount: 'Retry + Payload Change (페이로드 변경 재시도)',
+  authAddedAfter401Count: '401 → Authorization Added (401 후 인증 추가)',
+  failureChangeSuccessCount: 'Failure → Change → Success (실패 후 변경 및 성공)'
+};
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>'"]/g, ch => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;'
+  })[ch]);
+}
+
+function scoreNumber(value) { return Math.round((Number(value) || 0) * 100); }
+function scoreCell(value, kind) {
+  const score = scoreNumber(value);
+  return `<span class="score"><span class="score-bar"><span class="score-fill ${kind}" style="width:${score}%"></span></span>${score}</span>`;
+}
+function fixed(value, digits = 2) { return Number(value || 0).toFixed(digits); }
 function statusClass(status) {
-  if (status >= 400) return 'status-404';
-  if (status >= 200 && status < 300) return 'status-2xx';
+  if (status >= 400) return 'status-error';
+  if (status >= 200 && status < 400) return 'status-success';
   return '';
 }
+function rowAttrs(kind, id) {
+  return `class="clickable" data-kind="${escapeHtml(kind)}" data-id="${escapeHtml(id)}"`;
+}
 
-async function openPath(sessionId) {
-  clearInterval(pollTimer);
-  const res = await fetch(`/__detection/api/sessions/${sessionId}/path`);
-  const data = await res.json();
-  document.getElementById('modalTitle').textContent =
-    `공격 경로 — ${sessionId.slice(0,8)} (${data.ip}) · ${data.requests.length}개 요청`;
-  document.getElementById('modalExport').innerHTML =
-    `<a href="/__detection/api/sessions/${sessionId}/path" target="_blank">⬇ 이 세션 로그 export (JSON)</a>`;
-  document.getElementById('pathList').innerHTML = data.requests.map((r, i) => `
-    <div class="path-item">
-      <div class="meta">#${i+1} · ${new Date(r.ts).toLocaleTimeString()} · ${r.method}
-        <span class="${statusClass(r.status)}">${r.status}</span>
-        ${(r.tags||[]).map(t => `<span class="tag">${t}</span>`).join('')}
-      </div>
-      <div class="url">${r.url}</div>
-      ${r.body ? `<div class="body">body: ${typeof r.body === 'string' ? r.body : JSON.stringify(r.body)}</div>` : ''}
+function setTab(tabName) {
+  state.activeTab = tabName;
+  document.querySelectorAll('.tab-button').forEach(button => {
+    const active = button.dataset.tab === tabName;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+  });
+  document.querySelectorAll('.tab-panel').forEach(panel => {
+    const active = panel.id === `panel-${tabName}`;
+    panel.classList.toggle('active', active);
+    panel.hidden = !active;
+  });
+}
+
+function updateSummary(sessions, actors, authGroups, ipEntries) {
+  const totalRequests = sessions.reduce((sum, session) => sum + Number(session.features?.totalRequests || 0), 0);
+  document.getElementById('summarySessions').textContent = sessions.length.toLocaleString();
+  document.getElementById('summaryActors').textContent = actors.length.toLocaleString();
+  document.getElementById('summaryAuthGroups').textContent = authGroups.length.toLocaleString();
+  document.getElementById('summaryRequests').textContent = totalRequests.toLocaleString();
+  document.getElementById('sessionTabCount').textContent = sessions.length.toLocaleString();
+  document.getElementById('actorTabCount').textContent = actors.length.toLocaleString();
+  document.getElementById('authTabCount').textContent = authGroups.length.toLocaleString();
+  document.getElementById('ipTabCount').textContent = ipEntries.length.toLocaleString();
+}
+
+async function refresh() {
+  const responses = await Promise.all([
+    fetch('/__detection/api/sessions'), fetch('/__detection/api/actors'),
+    fetch('/__detection/api/auth-groups'), fetch('/__detection/api/ip-entries')
+  ]);
+  const [sessions, actors, authGroups, ipEntries] = await Promise.all(responses.map(r => r.json()));
+  updateSummary(sessions, actors, authGroups, ipEntries);
+
+  document.getElementById('sessionRows').innerHTML = sessions
+    .sort((a,b) => Math.max(b.attackScore,b.automationScore)-Math.max(a.attackScore,a.automationScore))
+    .map(s => `<tr ${rowAttrs('sessions', s.sessionId)}>
+      <td><code>${escapeHtml(s.sessionId.slice(0,8))}</code></td><td>${escapeHtml(s.ip)}</td>
+      <td>${scoreCell(s.automationScore,'automation')}</td><td>${scoreCell(s.attackScore,'attack')}</td>
+      <td>${s.features.totalRequests}</td><td>${fixed(s.features.temporal.avgIntervalMs,0)}</td>
+      <td>${s.features.temporal.maxRequests2s}</td><td>${s.features.temporal.requests10s}</td>
+      <td>${fixed(s.features.exploration.notFoundRatio)}</td><td>${fixed(s.features.exploration.accessDeniedRatio)}</td>
+    </tr>`).join('');
+
+  document.getElementById('actorRows').innerHTML = actors
+    .sort((a,b) => Math.max(b.attackScore,b.automationScore)-Math.max(a.attackScore,a.automationScore))
+    .map(a => `<tr ${rowAttrs('actors', a.actorId)}>
+      <td><code>${escapeHtml(a.actorId.slice(0,18))}…</code></td><td>${escapeHtml(a.ip)}</td>
+      <td><code>${escapeHtml(a.fingerprint)}</code></td>
+      <td>${scoreCell(a.automationScore,'automation')}</td><td>${scoreCell(a.attackScore,'attack')}</td>
+      <td>${a.totalRequests}</td><td>${a.sessionCount}</td><td>${new Date(a.lastSeen).toLocaleString()}</td>
+    </tr>`).join('');
+
+  document.getElementById('authRows').innerHTML = authGroups
+    .sort((a,b) => Math.max(b.attackScore,b.automationScore)-Math.max(a.attackScore,a.automationScore))
+    .map(g => `<tr ${rowAttrs('auth-groups', g.authGroupId)}>
+      <td><code>${escapeHtml(g.authGroupId.slice(0,17))}…</code></td>
+      <td>${scoreCell(g.automationScore,'automation')}</td><td>${scoreCell(g.attackScore,'attack')}</td>
+      <td>${g.totalRequests}</td><td>${g.sessionCount}</td><td>${g.actorCount}</td>
+      <td>${new Date(g.lastSeen).toLocaleString()}</td>
+    </tr>`).join('');
+
+  document.getElementById('ipRows').innerHTML = ipEntries
+    .sort((a,b) => b.totalRequests-a.totalRequests)
+    .map(e => `<tr ${rowAttrs('ip-entries', e.ip)}>
+      <td><code>${escapeHtml(e.ip)}</code></td><td>${e.totalRequests}</td><td>${e.sessionCount}</td>
+      <td>${e.actorCandidateCount}</td><td>${e.features.behavior.uniqueNormalizedPaths}</td>
+      <td>${new Date(e.lastSeen).toLocaleString()}</td>
+    </tr>`).join('');
+
+  document.querySelectorAll('tr[data-kind]').forEach(row => {
+    row.addEventListener('click', () => openDetail(row.dataset.kind, row.dataset.id));
+  });
+}
+
+function flattenMetrics(object, prefix = '') {
+  const rows = [];
+  for (const [key, value] of Object.entries(object || {})) {
+    const name = prefix ? `${prefix}.${key}` : key;
+    if (Array.isArray(value)) rows.push([name, value.join(', ') || '—']);
+    else if (value && typeof value === 'object') rows.push(...flattenMetrics(value, name));
+    else rows.push([name, typeof value === 'number' ? fixed(value) : String(value ?? '—')]);
+  }
+  return rows;
+}
+
+function metricLabel(key) {
+  const segments = String(key).split('.');
+  const leaf = segments[segments.length - 1];
+  if (metricLabels[key]) return metricLabels[key];
+  if (metricLabels[leaf]) return metricLabels[leaf];
+  if (segments.length > 1 && segments[0] === 'statusCounts') return `HTTP ${leaf} (응답 수)`;
+  return key;
+}
+
+function metricPanel(title, object) {
+  return `<div class="panel"><h3>${escapeHtml(title)}</h3>${flattenMetrics(object)
+    .map(([key,value]) => `<div class="metric"><span class="key">${escapeHtml(metricLabel(key))}</span><span class="value">${escapeHtml(value)}</span></div>`)
+    .join('')}</div>`;
+}
+
+function renderRequests(requests) {
+  return (requests || []).map((r,index) => `<div class="path-item">
+    <div class="meta">#${index+1} · ${new Date(r.ts).toLocaleTimeString()} · ${escapeHtml(r.method)}
+      <span class="${statusClass(r.status)}">${escapeHtml(r.status)}</span>
+      · session <code>${escapeHtml((r.sessionId || '').slice(0,8))}</code>
+      ${(r.tags || []).map(tag => `<span class="tag">${escapeHtml(tag)}</span>`).join('')}
     </div>
-  `).join('') || '<p>기록된 요청이 없습니다.</p>';
+    <div class="operation">${escapeHtml(r.operation || '')}</div>
+    <div class="url">${escapeHtml(r.url)}</div>
+    ${r.body ? `<div class="body">body: ${escapeHtml(typeof r.body === 'string' ? r.body : JSON.stringify(r.body))}</div>` : ''}
+    ${r.experimentRunId ? `<div class="meta">experiment: ${escapeHtml(r.experimentRunId)}</div>` : ''}
+  </div>`).join('') || '<p class="empty">기록된 요청이 없습니다.</p>';
+}
+
+async function openDetail(kind, id) {
+  clearInterval(state.timer);
+  const encodedId = encodeURIComponent(id);
+  const response = await fetch(`/__detection/api/${kind}/${encodedId}`);
+  const data = await response.json();
+  const observationOnly = kind === 'ip-entries';
+  document.getElementById('modalTitle').textContent = `${entityLabels[kind] || kind} 상세 — ${id}`;
+  document.getElementById('modalExport').innerHTML = `<a href="/__detection/api/${escapeHtml(kind)}/${escapeHtml(encodedId)}" target="_blank" rel="noopener noreferrer">상세 JSON 열기</a>`;
+
+  const scoreHtml = observationOnly ? '<p class="notice">IP Observation(IP 관찰)은 관찰 전용이며 Score(점수) 및 차단 기준에 사용하지 않습니다.</p>' : `
+    <div class="score-grid">
+      ${metricPanel(`Automation Score (자동화 점수) · ${scoreNumber(data.automationScore)}`, data.automationBreakdown)}
+      ${metricPanel(`Attack Score (공격 점수) · ${scoreNumber(data.attackScore)}`, data.attackBreakdown)}
+    </div>`;
+  const features = data.features || {};
+  const sequence = features.behavior?.recentSequence || [];
+  const agentic = observationOnly ? null : data.agenticEvidence;
+  document.getElementById('detailContent').innerHTML = `
+    ${scoreHtml}
+    <div class="feature-grid">
+      ${metricPanel('Temporal Features (시간 특성)', features.temporal)}
+      ${metricPanel('Behavior Features (요청 행동 특성)', Object.fromEntries(Object.entries(features.behavior || {}).filter(([key]) => key !== 'recentSequence')))}
+      ${metricPanel('Exploration Features (탐색 특성)', features.exploration)}
+      ${metricPanel('Client Features (클라이언트 특성)', features.client)}
+      ${metricPanel('Attack Features (공격 특성)', features.attack)}
+    </div>
+    <div class="panel"><h3>Recent Sequence (최근 요청 순서 · 관찰 전용)</h3><ol class="sequence">
+      ${sequence.map(operation => `<li><code>${escapeHtml(operation)}</code></li>`).join('') || '<li>—</li>'}
+    </ol></div>
+    ${agentic ? metricPanel('Agentic Evidence (에이전트 행동 근거 · 관찰 전용, 미점수)', agentic) : ''}
+    <h3 class="section-title">Request Timeline (요청 타임라인)</h3>${renderRequests(data.requests)}
+  `;
   document.getElementById('backdrop').style.display = 'block';
 }
 
-async function openActorPath(actorId) {
-  clearInterval(pollTimer);
-  const encodedId = encodeURIComponent(actorId);
-  const res = await fetch(`/__detection/api/actors/${encodedId}/path`);
-  const data = await res.json();
-  document.getElementById('modalTitle').textContent =
-    `Actor 공격 경로 — ${actorId.slice(0,18)}… · ${data.sessionCount}개 세션 · ${data.requests.length}개 요청`;
-  document.getElementById('modalExport').innerHTML =
-    `<a href="/__detection/api/actors/${encodedId}/path" target="_blank">⬇ 이 Actor 로그 export (JSON)</a>`;
-  document.getElementById('pathList').innerHTML = data.requests.map((r, i) => `
-    <div class="path-item">
-      <div class="meta">#${i+1} · ${new Date(r.ts).toLocaleTimeString()} · ${r.method}
-        <span class="${statusClass(r.status)}">${r.status}</span>
-        · session <code>${r.sessionId.slice(0,8)}</code>
-        ${(r.tags||[]).map(t => `<span class="tag">${t}</span>`).join('')}
-      </div>
-      <div class="url">${r.url}</div>
-      ${r.body ? `<div class="body">body: ${typeof r.body === 'string' ? r.body : JSON.stringify(r.body)}</div>` : ''}
-    </div>
-  `).join('') || '<p>기록된 요청이 없습니다.</p>';
-  document.getElementById('backdrop').style.display = 'block';
-}
-
-async function openAuthGroupPath(authGroupId) {
-  clearInterval(pollTimer);
-  const encodedId = encodeURIComponent(authGroupId);
-  const res = await fetch(`/__detection/api/auth-groups/${encodedId}/path`);
-  const data = await res.json();
-  document.getElementById('modalTitle').textContent =
-    `Auth Group 공격 경로 — ${authGroupId.slice(0,17)}… · ${data.sessionCount}개 세션 · ${data.requests.length}개 요청`;
-  document.getElementById('modalExport').innerHTML =
-    `<a href="/__detection/api/auth-groups/${encodedId}/path" target="_blank">⬇ 이 Auth Group 로그 export (JSON)</a>`;
-  document.getElementById('pathList').innerHTML = data.requests.map((r, i) => `
-    <div class="path-item">
-      <div class="meta">#${i+1} · ${new Date(r.ts).toLocaleTimeString()} · ${r.method}
-        <span class="${statusClass(r.status)}">${r.status}</span>
-        · session <code>${r.sessionId.slice(0,8)}</code>
-        ${(r.tags||[]).map(t => `<span class="tag">${t}</span>`).join('')}
-      </div>
-      <div class="url">${r.url}</div>
-      ${r.body ? `<div class="body">body: ${typeof r.body === 'string' ? r.body : JSON.stringify(r.body)}</div>` : ''}
-    </div>
-  `).join('') || '<p>기록된 요청이 없습니다.</p>';
-  document.getElementById('backdrop').style.display = 'block';
-}
-
-function closeModal(e) {
+function closeModal() {
   document.getElementById('backdrop').style.display = 'none';
-  pollTimer = setInterval(refresh, 2000);
+  state.timer = setInterval(refresh, 2000);
 }
 
+document.getElementById('closeButton').addEventListener('click', closeModal);
+document.getElementById('backdrop').addEventListener('click', event => {
+  if (event.target.id === 'backdrop') closeModal();
+});
+document.getElementById('themeToggle').addEventListener('click', toggleTheme);
+document.querySelectorAll('.tab-button').forEach(button => {
+  button.addEventListener('click', () => setTab(button.dataset.tab));
+});
+initializeTheme();
+setTab('actors');
 refresh();
-pollTimer = setInterval(refresh, 2000);
+state.timer = setInterval(refresh, 2000);
 </script>
 </body>
 </html>

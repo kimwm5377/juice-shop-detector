@@ -1,8 +1,8 @@
 # Juice Shop AI 공격자 탐지 레이어
 
 OWASP Juice Shop 앞단에 붙는 리버스 프록시형 탐지 레이어입니다.
-모든 요청/응답을 가로채 세션 단위로 행동 데이터를 쌓고, 규칙 기반 가중치 스코어링으로
-"사람 / 의심 / AI·봇 공격자"를 실시간으로 분류합니다.
+모든 요청/응답을 가로채 집계 단위별 행동 데이터를 쌓고, 자동화 징후와 공격 징후를
+서로 독립된 heuristic Score로 제공합니다. 이 값은 사람이나 AI를 확정하는 확률이 아닙니다.
 
 ```
 Browser / AI Agent ──▶ detection-proxy (:8080) ──▶ juice-shop (:3000)
@@ -10,6 +10,7 @@ Browser / AI Agent ──▶ detection-proxy (:8080) ──▶ juice-shop (:3000
                               ├─ Session 로그 (세션 쿠키 dlsid 기준)
                               ├─ Client Actor 집계 (IP + 헤더 fingerprint 기준)
                               ├─ Auth Group 집계 (동일 Bearer token hash 기준)
+                              ├─ IP Entry 관찰 (동일 IP 전체, 점수/차단 제외)
                               ├─ HTML 응답에 telemetry.js 자동 주입
                               ├─ POST /__detection/telemetry 로 마우스/스크롤/DOM 이벤트 수집
                               └─ GET  /__detection/dashboard  실시간 대시보드
@@ -26,27 +27,25 @@ docker compose up --build
 - 세션 API: http://localhost:8080/__detection/api/sessions
 - Client Actor API: http://localhost:8080/__detection/api/actors
 - Auth Group API: http://localhost:8080/__detection/api/auth-groups
+- IP Entry API: http://localhost:8080/__detection/api/ip-entries
 
-## 사용한 탐지 Feature
+## Feature와 Score
 
 | Feature | 설명 | 위치 |
 |---|---|---|
-| 평균 요청 간격 / 규칙성(CV) | 너무 빠르거나(사람 반응속도 이하) 간격이 지나치게 일정하면 봇 의심. Session/Actor/Auth Group별로 독립 계산 | `featureExtractor.js` → `avgIntervalMs`, `intervalCV` |
-| URL 다양성 | 짧은 시간에 매우 다양한 경로를 두드리면 엔드포인트 스캐닝(AI 정찰) 의심 | `urlDiversity` |
-| 404 비율 | 존재하지 않는 경로 요청 비율이 높으면 무차별 fuzzing/enumeration 의심 | `notFoundRatio` |
-| 헤더 Fingerprint | User-Agent가 자동화 도구(curl/python-requests/Playwright 등) 패턴이거나, 실브라우저가 항상 보내는 `Sec-Fetch-*`, `Accept-Language` 헤더가 없으면 의심 | `uaSignatures.js` |
-| Mouse Move 수 | 페이지 응답을 받고도 마우스 이동이 전혀 없으면 강한 봇 신호 | `telemetry.js` → `mouseMoveCount` |
-| Scroll 이벤트 | 스크롤이 전혀 없으면 봇 의심 | `scrollCount` |
-| DOM 이벤트 다양성 | click/keydown/focus 등 이벤트 종류가 다양할수록 사람일 가능성 | `domEventDiversity` |
-| 요청 Burst 길이 | 2초 슬라이딩 윈도우 내 최대 요청 수. 사람은 클릭 간 지연이 있음 | `maxBurst()` |
-| (추가) 세션 Churn | 같은 IP와 헤더 fingerprint에서 세션 쿠키가 계속 바뀌면 쿠키를 보존하지 않는 스크립트일 가능성. Actor/Auth Group에서 계산 | `sessionChurn` |
+| Temporal | 최근 50개 요청의 평균 간격/CV, 2초 최대 요청 수, 최근 10초 요청 수 | Automation |
+| Behavior | 최근 10개 operation, 최근 20개 반복률/최대 연속 반복, 최근 50개 경로 다양성 | 반복만 Automation, 나머지 관찰 |
+| Exploration | 최근 50개 요청의 404 비율과 401/403 비율 | Attack |
+| Client | Session churn, Header anomaly, 통합 Browser interaction | Automation |
+| Attack | 최근 50개 요청의 SQLi/XSS/Traversal 등 payload signature | Attack |
 
-각 feature는 0(사람 같음)~1(봇 같음)로 정규화된 뒤 가중합으로 최종 score(0~1)를 산출합니다
-(`lib/classifier.js`의 `WEIGHTS` 참고).
+Automation Score는 Timing 20%, Intensity 20%, Repeated Operation 15%, Session Churn 10%,
+Header Anomaly 15%, Browser Interaction 20%로 구성됩니다. Attack Score는 Payload Signature
+70%, 404 Exploration 15%, 401/403 Exploration 15%로 구성됩니다. Sequence와 Path Diversity는
+실험 데이터가 확보되기 전까지 점수화하지 않습니다.
 
-- `score < 0.4` → `human`
-- `0.4 ≤ score < 0.7` → `suspicious`
-- `score ≥ 0.7` → `likely-ai-bot`
+각 점수는 0~1 내부값을 Dashboard에서 0~100 Score로 표시하는 실험 전 휴리스틱이며 확률이 아닙니다.
+Agentic Evidence도 원시 count로만 제공하며 별도 점수, 가중치, AI Agent 라벨을 생성하지 않습니다.
 
 ## 공격 경로(타임라인) 보기
 
@@ -65,9 +64,14 @@ curl http://localhost:8080/__detection/api/sessions/<sessionId>/path
 curl http://localhost:8080/__detection/api/export -o detection-log-export.json
 ```
 
-각 요청 로그 항목은 `{ ts, method, url, status, body, tags, authGroupId }` 형태이며,
+각 요청 로그에는 `sessionId`, `actorId`, `authGroupId`, `normalizedPath`, `operation`,
+`payloadFingerprint`, `hasAuthorization`, `experimentRunId`가 포함됩니다.
 `body`는 최대 2000자로 잘려 저장됩니다(메모리 보호). `tags`는 `lib/payloadSignatures.js`에
 정의된 정규식으로 자동 태깅되며, 필요에 맞게 시그니처를 추가/수정할 수 있습니다.
+
+`normalizedPath`는 query를 제거하고 숫자 경로 segment를 `:id`, UUID를 `:uuid`로 바꿉니다.
+`payloadFingerprint`는 canonical payload의 HMAC-SHA256이며 키는 `PAYLOAD_FINGERPRINT_KEY`로
+주입합니다. 키가 없으면 프로세스 수명 동안만 유효한 임시 키를 사용하고 경고를 출력합니다.
 
 ## Authorization Auth Group
 
@@ -75,7 +79,8 @@ curl http://localhost:8080/__detection/api/export -o detection-log-export.json
 SHA-256 hash인 `auth:<64자리 hex>`로 즉시 변환됩니다. 같은 token을 사용한 요청은
 `dlsid`가 달라도 동일 Auth Group에 기록되며, Authorization이 없는 요청의
 `authGroupId`는 `null`입니다. Auth Group은 그룹에 속한 모든 요청과 세션 텔레메트리를
-하나의 행위자 흐름으로 집계해 세션과 동일한 classifier로 점수를 계산합니다. 대시보드에서
+하나의 인증 흐름으로 집계해 Automation/Attack Score를 계산합니다. Agentic Evidence는
+Actor별로 먼저 계산한 뒤 합산하므로 서로 다른 Actor의 transition을 연결하지 않습니다. 대시보드에서
 Auth Group 행을 클릭하면 그룹 전체의 시간순 공격 경로를 볼 수 있습니다.
 
 ```bash
@@ -84,13 +89,14 @@ curl http://localhost:8080/__detection/api/auth-groups/<authGroupId>
 curl http://localhost:8080/__detection/api/auth-groups/<authGroupId>/path
 ```
 
-## Client Actor
+## Client Actor Candidate
 
 Session 표는 각 `dlsid`에 기록된 요청만으로 점수를 계산합니다. 쿠키를 보존하지 않는
 CLI/스크립트 요청은 `IP + 헤더 fingerprint(User-Agent, Accept, Accept-Language,
 Accept-Encoding)`로 만든 Client Actor에서 별도로 합산합니다. 따라서 Docker/NAT에서
 동일 IP로 보이는 브라우저와 curl이 한 행으로 합쳐지지 않으면서, 같은 curl이 매 요청마다
-새 `dlsid`를 발급받는 session churn은 계속 탐지할 수 있습니다.
+새 `dlsid`를 발급받는 session churn은 계속 탐지할 수 있습니다. 이 그룹은 실제 사용자를
+확정하는 ID가 아니라 heuristic actor candidate입니다.
 
 ```bash
 curl http://localhost:8080/__detection/api/actors
@@ -98,25 +104,35 @@ curl http://localhost:8080/__detection/api/actors/<actorId>
 curl http://localhost:8080/__detection/api/actors/<actorId>/path
 ```
 
-차단 모드에서는 Session 점수와 Client Actor 점수 중 높은 값을 사용합니다.
+IP Entry는 동일 IP 요청을 관찰하기 위한 별도 집계이며 NAT/Docker 혼합 가능성 때문에
+Automation/Attack Score와 차단 기준에 사용하지 않습니다.
 
 > 참고: 로그인 폼 등 POST body는 `express.json()`/`urlencoded()`로 한 번 파싱한 뒤
 > `fixRequestBody()`로 다시 스트림에 실어 juice-shop으로 정상 전달합니다(그래야 로그인 등
 > 실제 앱 동작이 깨지지 않습니다).
 
-## 자동 차단 (선택)
+## Log-only와 실험 Run ID
 
-기본은 탐지·로깅만 수행합니다. 실제로 차단하려면 `docker-compose.yml`에서:
+현재 버전은 `BLOCK_MODE=true`여도 임계치 이상 탐지 결과를 로그로만 기록하며 응답을 403으로
+변경하지 않습니다. FPR/FNR 검증 후 별도 차단 정책을 결정할 예정입니다.
+
+실험 환경에서는 다음 설정과 헤더로 ground truth 구간을 표시할 수 있습니다.
 
 ```yaml
 environment:
-  - BLOCK_MODE=true
-  - BLOCK_THRESHOLD=0.75   # 이 점수 이상이면 403 반환
+  - ENABLE_EXPERIMENT_RUN_ID=true
 ```
+
+```http
+X-Experiment-Run-Id: codex-run-001
+```
+
+Run ID는 형식 검증 후 요청 레코드에만 저장되며 Feature, Score, Actor 식별에 사용되지 않습니다.
+프록시는 이 헤더를 Juice Shop target으로 전달하지 않습니다.
 
 ## 한계 및 개선 방향
 
 - 현재는 **인메모리 저장소**라 프록시 재시작 시 세션 데이터가 초기화됩니다. 장기 운영 시 Redis 등으로 교체 권장.
-- 규칙 기반 가중합 방식이라 임계치/가중치는 실제 트래픽으로 튜닝이 필요합니다. `lib/classifier.js`의 `WEIGHTS`, 각 `score*()` 함수의 정규화 상수를 조정하세요.
+- 규칙 기반 가중합 방식이라 임계치/가중치는 실제 트래픽으로 튜닝이 필요합니다. `lib/classifier.js`의 `AUTOMATION_WEIGHTS`, `ATTACK_WEIGHTS`, `NORMALIZATION`을 조정하세요.
 - 정교한 AI 에이전트(마우스를 인위적으로 흔드는 컴퓨터 사용 에이전트 등)에 대응하려면 마우스 이동의 **궤적 자연스러움**(가속도, 곡률, jitter)까지 분석하는 고급 feature 추가를 권장합니다.
 - 텔레메트리는 JS를 실행하는 클라이언트에서만 수집됩니다. JS를 실행하지 않는 순수 HTTP 클라이언트(대부분의 스크립트/curl 기반 AI 에이전트)는 `hasTelemetry=false`로 별도 취급되며, 이 자체도 강한 신호로 반영됩니다.

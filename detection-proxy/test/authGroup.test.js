@@ -123,9 +123,10 @@ test("Auth Group 전체 요청으로 score와 feature를 계산한다", () => {
   const verdict = classify(features);
 
   assert.equal(features.totalRequests, 4);
-  assert.equal(features.sessionChurn, 2);
-  assert.equal(features.attackSignatureHits, 4);
-  assert.deepEqual(features.attackCategories, ["sqli"]);
-  assert.ok(verdict.score > 0);
-  assert.ok(["human", "suspicious", "likely-ai-bot"].includes(verdict.label));
+  assert.equal(features.client.sessionChurn, 2);
+  assert.equal(features.attack.payloadSignatureHits, 4);
+  assert.deepEqual(features.attack.payloadCategories, ["sqli"]);
+  assert.ok(verdict.attackScore > 0);
+  assert.equal(verdict.label, undefined);
+  assert.equal(verdict.score, undefined);
 });

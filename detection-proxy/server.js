@@ -1,5 +1,6 @@
 const express = require("express");
 const cookieParser = require("cookie-parser");
+const crypto = require("crypto");
 const {
   createProxyMiddleware,
   responseInterceptor,
@@ -13,14 +14,27 @@ const {
   extractFeatures,
   extractActorFeatures,
   extractAuthGroupFeatures,
+  extractIpFeatures,
 } = require("./lib/featureExtractor");
 const { classify } = require("./lib/classifier");
 const { tagPayload } = require("./lib/payloadSignatures");
+const {
+  createPayloadFingerprint,
+  sanitizeExperimentRunId,
+} = require("./lib/requestMetadata");
+const {
+  computeAgenticEvidence,
+  computePartitionedAgenticEvidence,
+} = require("./lib/agenticEvidence");
 
 const PORT = process.env.PORT || 8080;
 const TARGET = process.env.JUICE_SHOP_URL || "http://localhost:3000";
 const BLOCK_MODE = process.env.BLOCK_MODE === "true";
-const BLOCK_THRESHOLD = parseFloat(process.env.BLOCK_THRESHOLD || "0.75");
+const LOG_THRESHOLD = parseFloat(process.env.BLOCK_THRESHOLD || "0.75");
+const ENABLE_EXPERIMENT_RUN_ID = process.env.ENABLE_EXPERIMENT_RUN_ID === "true";
+const EXPERIMENT_RUN_HEADER = "x-experiment-run-id";
+const configuredPayloadFingerprintKey = process.env.PAYLOAD_FINGERPRINT_KEY;
+const PAYLOAD_FINGERPRINT_KEY = configuredPayloadFingerprintKey || crypto.randomBytes(32);
 
 const SESSION_COOKIE = "dlsid";
 
@@ -32,6 +46,34 @@ function getClientIp(req) {
   const xf = req.headers["x-forwarded-for"];
   if (xf) return xf.split(",")[0].trim();
   return req.socket.remoteAddress || "unknown";
+}
+
+function analyzeSession(session) {
+  const features = extractFeatures(session);
+  return {
+    ...classify(features),
+    features,
+    agenticEvidence: computeAgenticEvidence(session.requests),
+  };
+}
+
+function analyzeActor(actor) {
+  const features = extractActorFeatures(actor, store.getSession);
+  return {
+    ...classify(features),
+    features,
+    agenticEvidence: computeAgenticEvidence(actor.requests),
+  };
+}
+
+function analyzeAuthGroup(group) {
+  const features = extractAuthGroupFeatures(group, store.getSession);
+  return {
+    ...classify(features),
+    features,
+    // 동일 token을 공유하는 서로 다른 Actor의 transition은 연결하지 않는다.
+    agenticEvidence: computePartitionedAgenticEvidence(group.requests),
+  };
 }
 
 // 세션 쿠키 부여 (없으면 새로 발급)
@@ -65,16 +107,11 @@ app.post("/__detection/telemetry", (req, res) => {
 
 app.get("/__detection/api/sessions", (req, res) => {
   const result = store.getAllSessions().map((s) => {
-    const features = extractFeatures(s);
-    const { score, label, breakdown } = classify(features);
     return {
       sessionId: s.id,
       actorId: s.actorId,
       ip: s.ip,
-      score,
-      label,
-      breakdown,
-      features,
+      ...analyzeSession(s),
       firstSeen: s.firstSeen,
       lastSeen: s.lastSeen,
     };
@@ -85,9 +122,16 @@ app.get("/__detection/api/sessions", (req, res) => {
 app.get("/__detection/api/sessions/:id", (req, res) => {
   const s = store.getSession(req.params.id);
   if (!s) return res.status(404).json({ error: "not found" });
-  const features = extractFeatures(s);
-  const verdict = classify(features);
-  res.json({ sessionId: s.id, actorId: s.actorId, ip: s.ip, ...verdict, features });
+  res.json({
+    sessionId: s.id,
+    actorId: s.actorId,
+    actorIds: Array.from(s.actorIds),
+    ip: s.ip,
+    ...analyzeSession(s),
+    firstSeen: s.firstSeen,
+    lastSeen: s.lastSeen,
+    requests: s.requests,
+  });
 });
 
 // 세션의 공격 경로 = 시간순 요청 타임라인 (url, method, status, body, 시그니처 태그)
@@ -104,16 +148,11 @@ app.get("/__detection/api/sessions/:id/path", (req, res) => {
 
 app.get("/__detection/api/actors", (req, res) => {
   const result = store.getAllActors().map((actor) => {
-    const features = extractActorFeatures(actor, store.getSession);
-    const { score, label, breakdown } = classify(features);
     return {
       actorId: actor.id,
       ip: actor.ip,
       fingerprint: actor.fingerprint,
-      score,
-      label,
-      breakdown,
-      features,
+      ...analyzeActor(actor),
       totalRequests: actor.totalRequests,
       sessionCount: actor.sessionIds.size,
       firstSeen: actor.firstSeen,
@@ -126,14 +165,11 @@ app.get("/__detection/api/actors", (req, res) => {
 app.get("/__detection/api/actors/:id", (req, res) => {
   const actor = store.getActor(req.params.id);
   if (!actor) return res.status(404).json({ error: "not found" });
-  const features = extractActorFeatures(actor, store.getSession);
-  const verdict = classify(features);
   res.json({
     actorId: actor.id,
     ip: actor.ip,
     fingerprint: actor.fingerprint,
-    ...verdict,
-    features,
+    ...analyzeActor(actor),
     firstSeen: actor.firstSeen,
     lastSeen: actor.lastSeen,
     totalRequests: actor.totalRequests,
@@ -158,16 +194,12 @@ app.get("/__detection/api/actors/:id/path", (req, res) => {
 
 app.get("/__detection/api/auth-groups", (req, res) => {
   const result = store.getAllAuthGroups().map((group) => {
-    const features = extractAuthGroupFeatures(group, store.getSession);
-    const { score, label, breakdown } = classify(features);
     return {
       authGroupId: group.id,
-      score,
-      label,
-      breakdown,
-      features,
+      ...analyzeAuthGroup(group),
       totalRequests: group.totalRequests,
       sessionCount: group.sessionIds.size,
+      actorCount: group.actorIds.size,
       firstSeen: group.firstSeen,
       lastSeen: group.lastSeen,
     };
@@ -178,18 +210,50 @@ app.get("/__detection/api/auth-groups", (req, res) => {
 app.get("/__detection/api/auth-groups/:id", (req, res) => {
   const group = store.getAuthGroup(req.params.id);
   if (!group) return res.status(404).json({ error: "not found" });
-  const features = extractAuthGroupFeatures(group, store.getSession);
-  const verdict = classify(features);
   res.json({
     authGroupId: group.id,
-    ...verdict,
-    features,
+    ...analyzeAuthGroup(group),
     firstSeen: group.firstSeen,
     lastSeen: group.lastSeen,
     totalRequests: group.totalRequests,
     sessionCount: group.sessionIds.size,
     sessionIds: Array.from(group.sessionIds),
+    actorCount: group.actorIds.size,
+    actorIds: Array.from(group.actorIds),
     requests: [...group.requests].sort((a, b) => a.ts - b.ts),
+  });
+});
+
+// IP Entry는 NAT/Docker 혼합 가능성이 있어 관찰 Feature만 제공하며 점수/차단에 사용하지 않는다.
+app.get("/__detection/api/ip-entries", (req, res) => {
+  res.json(
+    store.getAllIpEntries().map((entry) => ({
+      ip: entry.ip,
+      totalRequests: entry.totalRequests,
+      sessionCount: entry.sessionIds.size,
+      actorCandidateCount: entry.actorIds.size,
+      firstSeen: entry.firstSeen,
+      lastSeen: entry.lastSeen,
+      features: extractIpFeatures(entry, store.getSession),
+    }))
+  );
+});
+
+app.get("/__detection/api/ip-entries/:ip", (req, res) => {
+  const entry = store.getIpEntry(req.params.ip);
+  if (!entry) return res.status(404).json({ error: "not found" });
+  res.json({
+    ip: entry.ip,
+    observationOnly: true,
+    totalRequests: entry.totalRequests,
+    sessionCount: entry.sessionIds.size,
+    sessionIds: Array.from(entry.sessionIds),
+    actorCandidateCount: entry.actorIds.size,
+    actorIds: Array.from(entry.actorIds),
+    firstSeen: entry.firstSeen,
+    lastSeen: entry.lastSeen,
+    features: extractIpFeatures(entry, store.getSession),
+    requests: [...entry.requests].sort((a, b) => a.ts - b.ts),
   });
 });
 
@@ -208,8 +272,6 @@ app.get("/__detection/api/auth-groups/:id/path", (req, res) => {
 // 리포트용 전체 export (세션 1개 또는 전체)
 app.get("/__detection/api/export", (req, res) => {
   const result = store.getAllSessions().map((s) => {
-    const features = extractFeatures(s);
-    const verdict = classify(features);
     return {
       sessionId: s.id,
       actorId: s.actorId,
@@ -217,8 +279,7 @@ app.get("/__detection/api/export", (req, res) => {
       userAgent: s.userAgent,
       firstSeen: s.firstSeen,
       lastSeen: s.lastSeen,
-      verdict,
-      features,
+      analysis: analyzeSession(s),
       requests: s.requests,
     };
   });
@@ -226,7 +287,13 @@ app.get("/__detection/api/export", (req, res) => {
   res.json(result);
 });
 
-// --- 실제 Juice Shop 리버스 프록시 (요청 로깅 + HTML에 telemetry.js 주입 + 선택적 차단) ---
+// 등록되지 않은 탐지 내부 경로가 Juice Shop 프록시로 흘러가 탐지 요청으로
+// 기록되지 않도록 네임스페이스 전체를 여기서 종료한다.
+app.use("/__detection", (req, res) => {
+  res.status(404).json({ error: "detection endpoint not found" });
+});
+
+// --- 실제 Juice Shop 리버스 프록시 (요청 로깅 + HTML telemetry 주입, 현재 차단은 log-only) ---
 app.use(
   "/",
   createProxyMiddleware({
@@ -235,9 +302,21 @@ app.use(
     selfHandleResponse: true,
     onProxyReq: (proxyReq, req) => {
       req._detectionStart = Date.now();
+      const rawExperimentRunId = req.headers[EXPERIMENT_RUN_HEADER];
+      req.experimentRunId = ENABLE_EXPERIMENT_RUN_ID
+        ? sanitizeExperimentRunId(rawExperimentRunId)
+        : null;
+      // Ground truth용 헤더는 탐지 프록시에서 소비하고 Juice Shop target에는 전달하지 않는다.
+      proxyReq.removeHeader(EXPERIMENT_RUN_HEADER);
       // raw Bearer token은 이 시점에만 읽고, 이후에는 단방향 hash ID만 전달한다.
       req.authGroupId = deriveAuthGroupId(req.headers.authorization);
-      req.detectionHeaders = store.withoutAuthorizationHeaders(req.headers);
+      req.hasAuthorization = typeof req.headers.authorization === "string";
+      req.detectionHeaders = store.withoutSensitiveHeaders(req.headers);
+      req.payloadFingerprint = createPayloadFingerprint(
+        req.body,
+        req.headers["content-type"] || "",
+        PAYLOAD_FINGERPRINT_KEY
+      );
       // express.json()/urlencoded()가 body를 이미 읽어버렸다면 juice-shop으로 다시 실어준다.
       // (안 해주면 로그인/주문 등 POST 요청 body가 juice-shop에 도달하지 않는다)
       fixRequestBody(proxyReq, req);
@@ -253,29 +332,27 @@ app.use(
         body: req.body,
         tags,
         authGroupId: req.authGroupId,
+        payloadFingerprint: req.payloadFingerprint,
+        hasAuthorization: req.hasAuthorization,
+        experimentRunId: req.experimentRunId,
       });
 
-      // BLOCK_MODE: 임계치 이상이면 실제 응답 대신 403 반환
+      // 실험 검증 전에는 BLOCK_MODE도 log-only다. 응답 상태나 body를 변경하지 않는다.
       if (BLOCK_MODE) {
-        const sessionVerdict = classify(extractFeatures(session));
+        const sessionAnalysis = analyzeSession(session);
         const actorId = store.deriveActorId(ip, store.headerFingerprint(req.detectionHeaders));
         const actor = store.getActor(actorId);
-        const actorVerdict = actor
-          ? classify(extractActorFeatures(actor, store.getSession))
-          : sessionVerdict;
-        const source = actorVerdict.score > sessionVerdict.score ? "actor" : "session";
-        const { score, label } = source === "actor" ? actorVerdict : sessionVerdict;
-        if (score >= BLOCK_THRESHOLD) {
-          res.statusCode = 403;
-          res.setHeader("Content-Type", "application/json");
-          return Buffer.from(
-            JSON.stringify({
-              blocked: true,
-              reason: "ai-attacker-detected",
-              source,
-              score,
-              label,
-            })
+        const actorAnalysis = actor ? analyzeActor(actor) : sessionAnalysis;
+        const actorSeverity = Math.max(actorAnalysis.attackScore, actorAnalysis.automationScore);
+        const sessionSeverity = Math.max(sessionAnalysis.attackScore, sessionAnalysis.automationScore);
+        const source = actorSeverity > sessionSeverity ? "actor" : "session";
+        const selected = source === "actor" ? actorAnalysis : sessionAnalysis;
+        if (
+          selected.attackScore >= LOG_THRESHOLD ||
+          selected.automationScore >= LOG_THRESHOLD
+        ) {
+          console.warn(
+            `[detection-proxy][log-only] ${source} automation=${selected.automationScore} attack=${selected.attackScore}`
           );
         }
       }
@@ -301,5 +378,13 @@ app.use(
 app.listen(PORT, () => {
   console.log(`[detection-proxy] listening on :${PORT} -> proxying ${TARGET}`);
   console.log(`[detection-proxy] dashboard: http://localhost:${PORT}/__detection/dashboard`);
-  console.log(`[detection-proxy] BLOCK_MODE=${BLOCK_MODE} threshold=${BLOCK_THRESHOLD}`);
+  console.log(
+    `[detection-proxy] BLOCK_MODE=${BLOCK_MODE} (log-only) threshold=${LOG_THRESHOLD}`
+  );
+  console.log(`[detection-proxy] experiment run header enabled=${ENABLE_EXPERIMENT_RUN_ID}`);
+  if (!configuredPayloadFingerprintKey) {
+    console.warn(
+      "[detection-proxy] PAYLOAD_FINGERPRINT_KEY is unset; using an ephemeral key (fingerprints change after restart)"
+    );
+  }
 });
