@@ -18,7 +18,7 @@ services:
       # 현재 버전은 true여도 탐지 결과만 기록하는 log-only 모드입니다.
       - BLOCK_MODE=false
       - BLOCK_THRESHOLD=0.75
-      - ENABLE_EXPERIMENT_RUN_ID=false
+      - ENABLE_EXPERIMENT_RUN_ID=true
       - PAYLOAD_FINGERPRINT_KEY=${PAYLOAD_FINGERPRINT_KEY:-}
     depends_on:
       - juice-shop
