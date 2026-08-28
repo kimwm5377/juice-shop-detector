@@ -1,18 +1,20 @@
 # Juice Shop AI 공격자 탐지 레이어
 
-OWASP Juice Shop 앞단에 붙는 리버스 프록시형 탐지 레이어입니다.
+OWASP Juice Shop을 기본 대상으로 실행하지만 `TARGET_URL`을 바꾸면 다른 HTTP 웹 서비스
+앞단에도 붙일 수 있는 리버스 프록시형 탐지 레이어입니다.
 모든 요청/응답을 가로채 집계 단위별 행동 데이터를 쌓고, 자동화 징후와 공격 징후를
 서로 독립된 heuristic Score로 제공합니다. 이 값은 사람이나 AI를 확정하는 확률이 아닙니다.
 
 ```
 Browser / AI Agent ──▶ detection-proxy (:8080) ──▶ juice-shop (:3000)
                               │
+                              ├─ ModSecurity 3.0.16 + OWASP CRS 4.25.1 (탐지 전용)
                               ├─ Session 로그 (세션 쿠키 dlsid 기준)
                               ├─ Client Actor 집계 (IP + 헤더 fingerprint 기준)
                               ├─ Auth Group 집계 (동일 Bearer token hash 기준)
                               ├─ IP Entry 관찰 (동일 IP 전체, 점수/차단 제외)
                               ├─ HTML 응답에 telemetry.js 자동 주입
-                              ├─ POST /__detection/telemetry 로 마우스/스크롤/DOM 이벤트 수집
+                              ├─ POST /__detection/telemetry 로 마우스/스크롤/DOM/SPA 이동 수집
                               └─ GET  /__detection/dashboard  실시간 대시보드
 ```
 
@@ -28,6 +30,12 @@ docker compose up --build
 - Client Actor API: http://localhost:8080/__detection/api/actors
 - Auth Group API: http://localhost:8080/__detection/api/auth-groups
 - IP Entry API: http://localhost:8080/__detection/api/ip-entries
+- CRS 상태 API: http://localhost:8080/__detection/api/crs-status
+
+외부에 노출되는 프록시는 Node의 `detection-proxy` 하나뿐입니다. ModSecurity는 같은
+컨테이너 안에서 지속 실행되는 규칙 평가 helper이며 별도 포트를 열거나 요청을 전달하지
+않습니다. `SecRuleEngine DetectionOnly`로 동작하므로 CRS 탐지 결과가 원래 응답을 차단하거나
+변경하지 않습니다.
 
 ## Feature와 Score
 
@@ -37,7 +45,7 @@ docker compose up --build
 | Behavior | 최근 10개 operation, 최근 20개 반복률/최대 연속 반복, 최근 50개 경로 다양성 | 반복만 Automation, 나머지 관찰 |
 | Exploration | 최근 50개 요청의 404 비율과 401/403 비율 | Attack |
 | Client | Session churn, Header anomaly, 통합 Browser interaction | Automation |
-| Attack | 최근 50개 요청의 SQLi/XSS/Traversal 등 payload signature | Attack |
+| Attack | 최근 50개 요청의 OWASP CRS 규칙 탐지 결과와 SQLi/XSS/Traversal 등 공격 유형 | Attack |
 
 Automation Score는 Timing 20%, Intensity 20%, Repeated Operation 15%, Session Churn 10%,
 Header Anomaly 15%, Browser Interaction 20%로 구성됩니다. Attack Score는 Payload Signature
@@ -47,11 +55,17 @@ Header Anomaly 15%, Browser Interaction 20%로 구성됩니다. Attack Score는 
 각 점수는 0~1 내부값을 Dashboard에서 0~100 Score로 표시하는 실험 전 휴리스틱이며 확률이 아닙니다.
 Agentic Evidence도 원시 count로만 제공하며 별도 점수, 가중치, AI Agent 라벨을 생성하지 않습니다.
 
+브라우저 텔레메트리는 문서와 내부 요소의 스크롤을 capture 단계에서 수집합니다. SPA 화면 이동은
+`history.pushState`, `history.replaceState`, `popstate`, `hashchange`를 관찰하며, 현재 URL에는
+query와 hash 경로를 포함합니다. `pageLoads`는 5초 주기 전송 횟수가 아니라 실제 문서에서
+텔레메트리 스크립트가 처음 실행된 횟수만 집계합니다. SPA 내부 이동 횟수는
+`routeChangeCount`로 별도 제공합니다.
+
 ## 공격 경로(타임라인) 보기
 
 대시보드(`/__detection/dashboard`)에서 세션 행을 클릭하면 그 세션이 시간순으로
 어떤 엔드포인트를 어떤 순서로 찔렀는지, 어떤 body(payload)를 보냈는지, 그리고
-알려진 공격 패턴(SQLi/XSS/path traversal/command injection/SSTI/NoSQLi/JWT 조작/IDOR probe)에
+알려진 공격 패턴(SQLi/XSS/path traversal/command injection 등)에
 해당하는지 태그와 함께 볼 수 있습니다.
 
 API로 직접 조회하려면:
@@ -66,12 +80,48 @@ curl http://localhost:8080/__detection/api/export -o detection-log-export.json
 
 각 요청 로그에는 `sessionId`, `actorId`, `authGroupId`, `normalizedPath`, `operation`,
 `payloadFingerprint`, `hasAuthorization`, `experimentRunId`가 포함됩니다.
-`body`는 최대 2000자로 잘려 저장됩니다(메모리 보호). `tags`는 `lib/payloadSignatures.js`에
-정의된 정규식으로 자동 태깅되며, 필요에 맞게 시그니처를 추가/수정할 수 있습니다.
+`body`는 최대 2000자로 잘려 저장됩니다(메모리 보호). 정상 컨테이너 환경에서는 OWASP CRS가
+URI·헤더·지원되는 요청 본문을 검사해 `attackDetection`, rule ID, anomaly score와 공격 유형을
+기록합니다. CRS가 비활성화되거나 실행되지 못한 경우에만 기존 `lib/payloadSignatures.js`의
+정규식을 최근 Attack Score용 fallback으로 사용하며, fallback 결과는 CRS 누적 이력에 넣지 않습니다.
+Authorization, Proxy-Authorization, Cookie와 실험 식별자 원문은 CRS helper로 전달하지 않습니다.
 
 `normalizedPath`는 query를 제거하고 숫자 경로 segment를 `:id`, UUID를 `:uuid`로 바꿉니다.
 `payloadFingerprint`는 canonical payload의 HMAC-SHA256이며 키는 `PAYLOAD_FINGERPRINT_KEY`로
 주입합니다. 키가 없으면 프로세스 수명 동안만 유효한 임시 키를 사용하고 경고를 출력합니다.
+
+요청·응답 형식과 크기는 `requestContentType`, `requestContentLength`, `requestBodyBytes`,
+`responseContentType`, `responseContentLength`, `responseBodyBytes`로 기록합니다. `ContentLength`는
+헤더에 선언된 크기이고 `BodyBytes`는 프록시가 본문을 처리하면서 관찰한 크기입니다. JSON과
+URL-encoded 요청의 `requestBodyBytes`는 body parser가 읽은 원본 buffer 기준이며, 파싱하지 않는
+multipart·바이너리 요청은 `null`일 수 있습니다. `responseBodyBytes`는 HTML telemetry 주입 전
+프록시 응답 buffer 기준입니다. 이 값들은 관찰 전용이며 Score에는 반영하지 않습니다.
+
+## OWASP CRS와 누적 공격 이력
+
+최근 Attack Score는 기존처럼 최근 50개 요청을 사용하므로 정상 요청이 이어지면 낮아질 수 있습니다.
+이와 별도로 Session, Actor Candidate, Auth Group에는 `attackHistory`를 유지합니다.
+
+- `hasAttackHistory`: CRS 공격 규칙이 한 번이라도 탐지됐는지
+- `maxAttackScore`: 해당 집계 단위에서 관찰된 과거 최고 Attack Score
+- `maxCrsAnomalyScore`: 단일 요청의 과거 최고 CRS anomaly score
+- `cumulativeRuleHits`: 누적 CRS 공격 규칙 탐지 수
+- `matchedRuleIds`, `attackCategories`: 지금까지 탐지된 규칙과 공격 유형
+- `firstAttackAt`, `lastAttackAt`: 최초·최근 CRS 공격 탐지 시각
+
+따라서 공격 요청이 최근 50개 윈도우 밖으로 밀려나도 누적 이력은 유지됩니다. 다만 저장소가
+현재 인메모리이므로 “누적” 범위는 프록시 프로세스가 실행 중인 동안이며 재시작 후 영구 보존이
+필요하면 Redis나 데이터베이스 저장을 추가해야 합니다. 대시보드 목록의 `Attack History`와
+각 상세 화면에서 현재 점수와 누적 이력을 분리해 확인할 수 있습니다.
+
+CRS는 JSON과 URL-encoded 원문 본문을 최대 1 MiB까지 검사하며 URI와 비민감 헤더는 요청 형식과
+무관하게 검사합니다. 현재 스트림을 별도로 복제하지 않는 multipart·임의 바이너리 요청은 URI와
+헤더만 CRS 검사 대상이며 본문 검사는 추후 보완 범위입니다. `CRS_MAX_BODY_BYTES`와
+`CRS_SCAN_TIMEOUT_MS`로 상한을 조정할 수 있습니다.
+
+이번 연동은 기존 `AUTOMATION_WEIGHTS`, `ATTACK_WEIGHTS`, 정규화 수치와 차단 동작을 변경하지
+않았습니다. CRS는 기존 payload signature의 입력 출처를 범용 규칙으로 확장하고, 누적 이력은
+현재 점수와 별도 관찰값으로 제공합니다.
 
 ## Authorization Auth Group
 
@@ -136,3 +186,10 @@ Run ID는 형식 검증 후 요청 레코드에만 저장되며 Feature, Score, 
 - 규칙 기반 가중합 방식이라 임계치/가중치는 실제 트래픽으로 튜닝이 필요합니다. `lib/classifier.js`의 `AUTOMATION_WEIGHTS`, `ATTACK_WEIGHTS`, `NORMALIZATION`을 조정하세요.
 - 정교한 AI 에이전트(마우스를 인위적으로 흔드는 컴퓨터 사용 에이전트 등)에 대응하려면 마우스 이동의 **궤적 자연스러움**(가속도, 곡률, jitter)까지 분석하는 고급 feature 추가를 권장합니다.
 - 텔레메트리는 JS를 실행하는 클라이언트에서만 수집됩니다. JS를 실행하지 않는 순수 HTTP 클라이언트(대부분의 스크립트/curl 기반 AI 에이전트)는 `hasTelemetry=false`로 별도 취급되며, 이 자체도 강한 신호로 반영됩니다.
+
+## 오픈소스 및 라이선스
+
+컨테이너 빌드는 Apache License 2.0인 OWASP ModSecurity `v3.0.16`과 OWASP Core Rule Set
+`v4.25.1`의 고정 commit을 사용합니다. 버전, source와 라이선스는
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)에 기록했습니다. 프로젝트 전용 adapter,
+누적 집계, API와 대시보드 로직은 외부 구현을 복사한 코드가 아닙니다.

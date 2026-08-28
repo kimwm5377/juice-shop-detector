@@ -18,6 +18,10 @@ services:
       # 현재 버전은 true여도 탐지 결과만 기록하는 log-only 모드입니다.
       - BLOCK_MODE=false
       - BLOCK_THRESHOLD=0.75
+      # 동일 프록시 컨테이너 내부에서 ModSecurity + OWASP CRS를 탐지 전용으로 실행합니다.
+      - CRS_ENABLED=true
+      - CRS_SCAN_TIMEOUT_MS=2000
+      - CRS_MAX_BODY_BYTES=1048576
       - ENABLE_EXPERIMENT_RUN_ID=true
       - PAYLOAD_FINGERPRINT_KEY=${PAYLOAD_FINGERPRINT_KEY:-}
     depends_on:

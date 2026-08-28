@@ -6,6 +6,8 @@ const {
   canonicalPayload,
   createPayloadFingerprint,
   sanitizeExperimentRunId,
+  sanitizeMetadataHeaderValue,
+  parseContentLength,
 } = require("../lib/requestMetadata");
 
 test("numeric ID, UUID, query를 보수적으로 normalizedPath로 변환한다", () => {
@@ -46,4 +48,16 @@ test("experimentRunId는 제한된 실험 식별자만 허용한다", () => {
   assert.equal(sanitizeExperimentRunId(" human_curl_001 "), "human_curl_001");
   assert.equal(sanitizeExperimentRunId("bad value"), null);
   assert.equal(sanitizeExperimentRunId("x".repeat(65)), null);
+});
+
+test("로깅용 헤더 값과 Content-Length를 보수적으로 정규화한다", () => {
+  assert.equal(sanitizeMetadataHeaderValue("application/json; charset=utf-8"), "application/json; charset=utf-8");
+  assert.equal(sanitizeMetadataHeaderValue(["text/plain", "ignored"]), "text/plain");
+  assert.equal(sanitizeMetadataHeaderValue(undefined), null);
+  assert.equal(sanitizeMetadataHeaderValue("x".repeat(300)).length, 256);
+  assert.equal(parseContentLength("123"), 123);
+  assert.equal(parseContentLength(" 0 "), 0);
+  assert.equal(parseContentLength("12.5"), null);
+  assert.equal(parseContentLength("-1"), null);
+  assert.equal(parseContentLength(undefined), null);
 });

@@ -44,8 +44,10 @@ function emptyTelemetry() {
   return {
     mouseMoveCount: 0,
     scrollCount: 0,
+    routeChangeCount: 0,
     domEventTypes: new Set(),
     pageLoads: 0,
+    currentUrl: null,
     lastTelemetryAt: null,
   };
 }
@@ -54,9 +56,13 @@ function aggregateTelemetry(memberSessions) {
   return memberSessions.reduce((result, session) => {
     result.mouseMoveCount += session.telemetry.mouseMoveCount;
     result.scrollCount += session.telemetry.scrollCount;
+    result.routeChangeCount += session.telemetry.routeChangeCount;
     session.telemetry.domEventTypes.forEach((eventType) => result.domEventTypes.add(eventType));
     result.pageLoads += session.telemetry.pageLoads;
     if (session.telemetry.lastTelemetryAt !== null) {
+      if (result.lastTelemetryAt === null || session.telemetry.lastTelemetryAt >= result.lastTelemetryAt) {
+        result.currentUrl = session.telemetry.currentUrl;
+      }
       result.lastTelemetryAt = Math.max(result.lastTelemetryAt || 0, session.telemetry.lastTelemetryAt);
     }
     return result;
@@ -121,6 +127,16 @@ function extractStreamFeatures({
   const attackRequests = recent(ordered, FEATURE_WINDOWS.attackRequests);
   const allTags = attackRequests.flatMap((request) => request.tags || []);
   const attackCategories = Array.from(new Set(allTags));
+  const crsResults = attackRequests
+    .map((request) => request.attackDetection)
+    .filter((result) => result?.available);
+  const crsRuleHits = crsResults.reduce(
+    (sum, result) => sum + (Number(result.ruleHitCount) || 0),
+    0
+  );
+  const matchedRuleIds = Array.from(
+    new Set(crsResults.flatMap((result) => (result.hits || []).map((hit) => hit.ruleId)))
+  );
   const experimentRunIds = Array.from(
     new Set(ordered.map((request) => request.experimentRunId).filter(Boolean))
   );
@@ -166,8 +182,10 @@ function extractStreamFeatures({
       browserInteraction: {
         mouseMoveCount: interaction.mouseMoveCount,
         scrollCount: interaction.scrollCount,
+        routeChangeCount: interaction.routeChangeCount,
         domEventDiversity: interaction.domEventTypes.size,
         pageLoads: interaction.pageLoads,
+        currentUrl: interaction.currentUrl,
         hasTelemetry: interaction.lastTelemetryAt !== null,
       },
     },
@@ -176,6 +194,13 @@ function extractStreamFeatures({
       payloadSignatureHits: allTags.length,
       distinctPayloadCategories: attackCategories.length,
       payloadCategories: attackCategories,
+      crsSampleSize: crsResults.length,
+      crsUnavailableCount: attackRequests.length - crsResults.length,
+      crsRuleHits,
+      maxCrsAnomalyScore: crsResults.length
+        ? Math.max(...crsResults.map((result) => Number(result.anomalyScore) || 0))
+        : 0,
+      matchedRuleIds,
     },
   };
 }

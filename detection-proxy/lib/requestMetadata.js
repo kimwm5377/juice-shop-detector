@@ -3,6 +3,20 @@ const crypto = require("crypto");
 const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const NUMERIC_SEGMENT = /^\d+$/;
 const EXPERIMENT_RUN_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const MAX_METADATA_HEADER_CHARS = 256;
+
+function sanitizeMetadataHeaderValue(value) {
+  if (Array.isArray(value)) value = value[0];
+  if (typeof value !== "string") return null;
+  return value.slice(0, MAX_METADATA_HEADER_CHARS);
+}
+
+function parseContentLength(value) {
+  if (Array.isArray(value)) value = value[0];
+  if (typeof value !== "string" || !/^\d+$/.test(value.trim())) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
 
 function normalizePath(rawUrl) {
   let pathname = "/";
@@ -76,4 +90,6 @@ module.exports = {
   canonicalPayload,
   createPayloadFingerprint,
   sanitizeExperimentRunId,
+  sanitizeMetadataHeaderValue,
+  parseContentLength,
 };

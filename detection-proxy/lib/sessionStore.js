@@ -21,6 +21,50 @@ const SENSITIVE_DETECTION_HEADERS = new Set([
   "x-experiment-run-id",
 ]);
 
+function emptyAttackHistory() {
+  return {
+    hasAttackHistory: false,
+    maxAttackScore: 0,
+    maxCrsAnomalyScore: 0,
+    cumulativeRuleHits: 0,
+    matchedRuleIds: [],
+    attackCategories: [],
+    firstAttackAt: null,
+    lastAttackAt: null,
+  };
+}
+
+function addUnique(target, values) {
+  const existing = new Set(target);
+  for (const value of values || []) {
+    if (value === undefined || value === null || value === "") continue;
+    existing.add(String(value));
+  }
+  target.splice(0, target.length, ...existing);
+}
+
+function recordCrsAttackHistory(entity, attackDetection, timestamp) {
+  if (!entity || !attackDetection?.available || !attackDetection.ruleHitCount) return false;
+  const history = entity.attackHistory || (entity.attackHistory = emptyAttackHistory());
+  history.hasAttackHistory = true;
+  history.cumulativeRuleHits += Number(attackDetection.ruleHitCount) || 0;
+  history.maxCrsAnomalyScore = Math.max(
+    history.maxCrsAnomalyScore,
+    Number(attackDetection.anomalyScore) || 0
+  );
+  addUnique(history.matchedRuleIds, (attackDetection.hits || []).map((hit) => hit.ruleId));
+  addUnique(history.attackCategories, attackDetection.categories);
+  if (history.firstAttackAt === null) history.firstAttackAt = timestamp;
+  history.lastAttackAt = timestamp;
+  return true;
+}
+
+function updateMaxAttackScore(entity, score) {
+  if (!entity || !Number.isFinite(score)) return;
+  const history = entity.attackHistory || (entity.attackHistory = emptyAttackHistory());
+  history.maxAttackScore = Math.max(history.maxAttackScore, score);
+}
+
 function withoutSensitiveHeaders(headers = {}) {
   return Object.fromEntries(
     Object.entries(headers).filter(
@@ -63,11 +107,14 @@ function getOrCreateSession(sessionId, ip) {
       actorId: null,
       actorIds: new Set(),
       userAgent: null,
+      attackHistory: emptyAttackHistory(),
       telemetry: {
         mouseMoveCount: 0,
         scrollCount: 0,
+        routeChangeCount: 0,
         domEventTypes: new Set(),
         pageLoads: 0,
+        currentUrl: null,
         lastTelemetryAt: null,
       },
     });
@@ -103,6 +150,13 @@ function recordRequest(
     payloadFingerprint = null,
     hasAuthorization,
     experimentRunId = null,
+    requestContentType = null,
+    requestContentLength = null,
+    requestBodyBytes = null,
+    responseContentType = null,
+    responseContentLength = null,
+    responseBodyBytes = null,
+    attackDetection = null,
     ts,
   }
 ) {
@@ -139,6 +193,13 @@ function recordRequest(
     payloadFingerprint,
     hasAuthorization: requestHasAuthorization,
     experimentRunId: experimentRunId || null,
+    requestContentType,
+    requestContentLength,
+    requestBodyBytes,
+    responseContentType,
+    responseContentLength,
+    responseBodyBytes,
+    attackDetection,
     body: truncateBody(body),
     tags: tags || [],
   };
@@ -157,6 +218,7 @@ function recordRequest(
         sessionIds: new Set(),
         actorIds: new Set(),
         requests: [],
+        attackHistory: emptyAttackHistory(),
       });
     }
     const authGroup = authGroups.get(authGroupId);
@@ -184,6 +246,7 @@ function recordRequest(
       totalRequests: 0,
       sessionIds: new Set(),
       requests: [],
+      attackHistory: emptyAttackHistory(),
     });
   }
   const actor = actors.get(actorId);
@@ -214,7 +277,19 @@ function recordRequest(
   ipEntry.requests.push({ ...requestRecord });
   if (ipEntry.requests.length > MAX_REQUESTS_PER_IP_ENTRY) ipEntry.requests.shift();
 
+  // 최근 요청 링버퍼와 별도로 CRS가 확인한 공격 규칙 이력을 누적한다.
+  // legacy 정규식 fallback은 CRS 결과와 섞이지 않도록 누적 이력에서 제외한다.
+  recordCrsAttackHistory(s, attackDetection, now);
+  recordCrsAttackHistory(actor, attackDetection, now);
+  if (authGroupId) recordCrsAttackHistory(authGroups.get(authGroupId), attackDetection, now);
+
   return s;
+}
+
+function updateAttackScoreHistory({ sessionId, actorId, authGroupId, scores = {} }) {
+  updateMaxAttackScore(sessions.get(sessionId), scores.session);
+  updateMaxAttackScore(actors.get(actorId), scores.actor);
+  if (authGroupId) updateMaxAttackScore(authGroups.get(authGroupId), scores.authGroup);
 }
 
 function recordTelemetry(sessionId, ip, payload) {
@@ -222,8 +297,10 @@ function recordTelemetry(sessionId, ip, payload) {
   const t = s.telemetry;
   t.mouseMoveCount += payload.mouseMoveCount || 0;
   t.scrollCount += payload.scrollCount || 0;
+  t.routeChangeCount += payload.routeChangeCount || 0;
   (payload.domEventTypes || []).forEach((ev) => t.domEventTypes.add(ev));
   t.pageLoads += payload.pageLoad ? 1 : 0;
+  if (typeof payload.url === "string") t.currentUrl = payload.url.slice(0, 2048);
   t.lastTelemetryAt = Date.now();
   return s;
 }
@@ -272,6 +349,8 @@ module.exports = {
   getAuthGroup,
   getAllIpEntries,
   getIpEntry,
+  updateAttackScoreHistory,
+  emptyAttackHistory,
   headerFingerprint,
   deriveActorId,
   withoutSensitiveHeaders,

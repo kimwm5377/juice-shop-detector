@@ -21,14 +21,17 @@ const { tagPayload } = require("./lib/payloadSignatures");
 const {
   createPayloadFingerprint,
   sanitizeExperimentRunId,
+  sanitizeMetadataHeaderValue,
+  parseContentLength,
 } = require("./lib/requestMetadata");
 const {
   computeAgenticEvidence,
   computePartitionedAgenticEvidence,
 } = require("./lib/agenticEvidence");
+const { CrsScanner } = require("./lib/crsScanner");
 
 const PORT = process.env.PORT || 8080;
-const TARGET = process.env.JUICE_SHOP_URL || "http://localhost:3000";
+const TARGET = process.env.TARGET_URL || process.env.JUICE_SHOP_URL || "http://localhost:3000";
 const BLOCK_MODE = process.env.BLOCK_MODE === "true";
 const LOG_THRESHOLD = parseFloat(process.env.BLOCK_THRESHOLD || "0.75");
 const ENABLE_EXPERIMENT_RUN_ID = process.env.ENABLE_EXPERIMENT_RUN_ID === "true";
@@ -37,6 +40,7 @@ const configuredPayloadFingerprintKey = process.env.PAYLOAD_FINGERPRINT_KEY;
 const PAYLOAD_FINGERPRINT_KEY = configuredPayloadFingerprintKey || crypto.randomBytes(32);
 
 const SESSION_COOKIE = "dlsid";
+const crsScanner = new CrsScanner();
 
 const app = express();
 app.disable("x-powered-by");
@@ -94,10 +98,15 @@ app.get("/__detection/dashboard", (req, res) => {
   res.sendFile(require("path").join(__dirname, "public", "dashboard.html"));
 });
 
+function captureParsedBodyBytes(req, _res, buffer) {
+  req.detectionRequestBodyBytes = buffer.length;
+  req.detectionRequestBodyBuffer = Buffer.from(buffer);
+}
+
 // JSON / urlencoded body만 파싱 (multipart, 바이너리 등은 그대로 통과되어 스트림이 안 깨짐).
 // 파싱된 body는 onProxyReq에서 fixRequestBody()로 다시 스트림에 실어 juice-shop으로 전달한다.
-app.use(express.json({ limit: "5mb" }));
-app.use(express.urlencoded({ extended: true, limit: "5mb" }));
+app.use(express.json({ limit: "5mb", verify: captureParsedBodyBytes }));
+app.use(express.urlencoded({ extended: true, limit: "5mb", verify: captureParsedBodyBytes }));
 
 app.post("/__detection/telemetry", (req, res) => {
   const ip = getClientIp(req);
@@ -112,6 +121,7 @@ app.get("/__detection/api/sessions", (req, res) => {
       actorId: s.actorId,
       ip: s.ip,
       ...analyzeSession(s),
+      attackHistory: s.attackHistory,
       firstSeen: s.firstSeen,
       lastSeen: s.lastSeen,
     };
@@ -128,6 +138,7 @@ app.get("/__detection/api/sessions/:id", (req, res) => {
     actorIds: Array.from(s.actorIds),
     ip: s.ip,
     ...analyzeSession(s),
+    attackHistory: s.attackHistory,
     firstSeen: s.firstSeen,
     lastSeen: s.lastSeen,
     requests: s.requests,
@@ -153,6 +164,7 @@ app.get("/__detection/api/actors", (req, res) => {
       ip: actor.ip,
       fingerprint: actor.fingerprint,
       ...analyzeActor(actor),
+      attackHistory: actor.attackHistory,
       totalRequests: actor.totalRequests,
       sessionCount: actor.sessionIds.size,
       firstSeen: actor.firstSeen,
@@ -170,6 +182,7 @@ app.get("/__detection/api/actors/:id", (req, res) => {
     ip: actor.ip,
     fingerprint: actor.fingerprint,
     ...analyzeActor(actor),
+    attackHistory: actor.attackHistory,
     firstSeen: actor.firstSeen,
     lastSeen: actor.lastSeen,
     totalRequests: actor.totalRequests,
@@ -197,6 +210,7 @@ app.get("/__detection/api/auth-groups", (req, res) => {
     return {
       authGroupId: group.id,
       ...analyzeAuthGroup(group),
+      attackHistory: group.attackHistory,
       totalRequests: group.totalRequests,
       sessionCount: group.sessionIds.size,
       actorCount: group.actorIds.size,
@@ -213,6 +227,7 @@ app.get("/__detection/api/auth-groups/:id", (req, res) => {
   res.json({
     authGroupId: group.id,
     ...analyzeAuthGroup(group),
+    attackHistory: group.attackHistory,
     firstSeen: group.firstSeen,
     lastSeen: group.lastSeen,
     totalRequests: group.totalRequests,
@@ -257,6 +272,13 @@ app.get("/__detection/api/ip-entries/:ip", (req, res) => {
   });
 });
 
+app.get("/__detection/api/crs-status", (req, res) => {
+  res.json({
+    mode: "detection-only",
+    ...crsScanner.status(),
+  });
+});
+
 // Auth Group의 공격 경로 = 동일 Bearer token을 쓴 모든 세션의 시간순 요청 타임라인
 app.get("/__detection/api/auth-groups/:id/path", (req, res) => {
   const group = store.getAuthGroup(req.params.id);
@@ -280,6 +302,7 @@ app.get("/__detection/api/export", (req, res) => {
       firstSeen: s.firstSeen,
       lastSeen: s.lastSeen,
       analysis: analyzeSession(s),
+      attackHistory: s.attackHistory,
       requests: s.requests,
     };
   });
@@ -317,13 +340,22 @@ app.use(
         req.headers["content-type"] || "",
         PAYLOAD_FINGERPRINT_KEY
       );
+      // ModSecurity/CRS 검사는 응답을 차단하지 않으며 결과만 비동기로 기록한다.
+      req.crsScanPromise = crsScanner.scan(req, getClientIp(req));
       // express.json()/urlencoded()가 body를 이미 읽어버렸다면 juice-shop으로 다시 실어준다.
       // (안 해주면 로그인/주문 등 POST 요청 body가 juice-shop에 도달하지 않는다)
       fixRequestBody(proxyReq, req);
     },
     onProxyRes: responseInterceptor(async (responseBuffer, proxyRes, req, res) => {
       const ip = getClientIp(req);
-      const tags = tagPayload(req.originalUrl, req.body);
+      const attackDetection = req.crsScanPromise
+        ? await req.crsScanPromise
+        : { available: false, error: "scan was not started", categories: [], hits: [] };
+      // 컨테이너 밖에서 단위 테스트를 실행하는 경우처럼 CRS 엔진을 사용할 수 없을 때만
+      // 기존 정규식을 fallback으로 유지한다. CRS 이력에는 이 fallback 결과를 섞지 않는다.
+      const tags = attackDetection.available
+        ? attackDetection.categories
+        : tagPayload(req.originalUrl, req.body);
       const session = store.recordRequest(req.detectionSessionId, ip, {
         method: req.method,
         url: req.originalUrl,
@@ -335,14 +367,36 @@ app.use(
         payloadFingerprint: req.payloadFingerprint,
         hasAuthorization: req.hasAuthorization,
         experimentRunId: req.experimentRunId,
+        requestContentType: sanitizeMetadataHeaderValue(req.headers["content-type"]),
+        requestContentLength: parseContentLength(req.headers["content-length"]),
+        requestBodyBytes: Number.isSafeInteger(req.detectionRequestBodyBytes)
+          ? req.detectionRequestBodyBytes
+          : null,
+        responseContentType: sanitizeMetadataHeaderValue(proxyRes.headers["content-type"]),
+        responseContentLength: parseContentLength(proxyRes.headers["content-length"]),
+        responseBodyBytes: responseBuffer.length,
+        attackDetection,
+      });
+
+      const sessionAnalysis = analyzeSession(session);
+      const actorId = session.requests.at(-1)?.actorId;
+      const actor = actorId ? store.getActor(actorId) : null;
+      const actorAnalysis = actor ? analyzeActor(actor) : sessionAnalysis;
+      const authGroup = req.authGroupId ? store.getAuthGroup(req.authGroupId) : null;
+      const authGroupAnalysis = authGroup ? analyzeAuthGroup(authGroup) : null;
+      store.updateAttackScoreHistory({
+        sessionId: session.id,
+        actorId,
+        authGroupId: req.authGroupId,
+        scores: {
+          session: sessionAnalysis.attackScore,
+          actor: actorAnalysis.attackScore,
+          authGroup: authGroupAnalysis?.attackScore,
+        },
       });
 
       // 실험 검증 전에는 BLOCK_MODE도 log-only다. 응답 상태나 body를 변경하지 않는다.
       if (BLOCK_MODE) {
-        const sessionAnalysis = analyzeSession(session);
-        const actorId = store.deriveActorId(ip, store.headerFingerprint(req.detectionHeaders));
-        const actor = store.getActor(actorId);
-        const actorAnalysis = actor ? analyzeActor(actor) : sessionAnalysis;
         const actorSeverity = Math.max(actorAnalysis.attackScore, actorAnalysis.automationScore);
         const sessionSeverity = Math.max(sessionAnalysis.attackScore, sessionAnalysis.automationScore);
         const source = actorSeverity > sessionSeverity ? "actor" : "session";
@@ -382,6 +436,7 @@ app.listen(PORT, () => {
     `[detection-proxy] BLOCK_MODE=${BLOCK_MODE} (log-only) threshold=${LOG_THRESHOLD}`
   );
   console.log(`[detection-proxy] experiment run header enabled=${ENABLE_EXPERIMENT_RUN_ID}`);
+  console.log(`[detection-proxy] CRS status=${JSON.stringify(crsScanner.status())}`);
   if (!configuredPayloadFingerprintKey) {
     console.warn(
       "[detection-proxy] PAYLOAD_FINGERPRINT_KEY is unset; using an ephemeral key (fingerprints change after restart)"

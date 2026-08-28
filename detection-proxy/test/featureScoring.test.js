@@ -7,8 +7,10 @@ const { classify, AUTOMATION_WEIGHTS, ATTACK_WEIGHTS } = require("../lib/classif
 const telemetry = {
   mouseMoveCount: 0,
   scrollCount: 0,
+  routeChangeCount: 0,
   domEventTypes: new Set(),
   pageLoads: 0,
+  currentUrl: null,
   lastTelemetryAt: null,
 };
 

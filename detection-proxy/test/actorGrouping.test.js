@@ -89,6 +89,12 @@ test("확장 요청 레코드는 식별자와 operation을 저장하고 민감 �
     payloadFingerprint: "payload-hmac",
     hasAuthorization: true,
     experimentRunId: "codex-run-001",
+    requestContentType: "application/json",
+    requestContentLength: 17,
+    requestBodyBytes: 17,
+    responseContentType: "application/json; charset=utf-8",
+    responseContentLength: 42,
+    responseBodyBytes: 42,
     tags: [],
   });
 
@@ -101,6 +107,73 @@ test("확장 요청 레코드는 식별자와 operation을 저장하고 민감 �
   assert.equal(request.payloadFingerprint, "payload-hmac");
   assert.equal(request.hasAuthorization, true);
   assert.equal(request.experimentRunId, "codex-run-001");
+  assert.equal(request.requestContentType, "application/json");
+  assert.equal(request.requestContentLength, 17);
+  assert.equal(request.requestBodyBytes, 17);
+  assert.equal(request.responseContentType, "application/json; charset=utf-8");
+  assert.equal(request.responseContentLength, 42);
+  assert.equal(request.responseBodyBytes, 42);
   assert.equal(JSON.stringify(session.headerSample).includes("raw-token"), false);
   assert.equal(session.headerSample["x-experiment-run-id"], undefined);
+});
+
+test("최근 50개 요청에서 공격이 밀려나도 CRS 누적 공격 이력은 유지된다", () => {
+  const sessionId = "crs-history-survives-window";
+  const ip = "127.0.0.77";
+  const detectedAt = 1_700_000_000_000;
+  const attackDetection = {
+    available: true,
+    engine: "owasp-modsecurity",
+    crsVersion: "4.25.1",
+    anomalyScore: 10,
+    ruleHitCount: 2,
+    categories: ["sqli"],
+    hits: [{ ruleId: "942100" }, { ruleId: "942190" }],
+  };
+
+  const session = store.recordRequest(sessionId, ip, {
+    method: "GET",
+    url: "/search?q=attack",
+    status: 200,
+    headers: cliHeaders,
+    tags: ["sqli"],
+    authGroupId: "auth:crs-history-test",
+    attackDetection,
+    ts: detectedAt,
+  });
+  for (let index = 0; index < 55; index++) {
+    record(sessionId, ip, `/clean/${index}`, cliHeaders);
+  }
+
+  const features = extractFeatures(session);
+  assert.equal(features.attack.crsRuleHits, 0);
+  assert.equal(features.attack.payloadSignatureHits, 0);
+  assert.deepEqual(session.attackHistory, {
+    hasAttackHistory: true,
+    maxAttackScore: 0,
+    maxCrsAnomalyScore: 10,
+    cumulativeRuleHits: 2,
+    matchedRuleIds: ["942100", "942190"],
+    attackCategories: ["sqli"],
+    firstAttackAt: detectedAt,
+    lastAttackAt: detectedAt,
+  });
+
+  store.updateAttackScoreHistory({
+    sessionId,
+    actorId: session.actorId,
+    authGroupId: "auth:crs-history-test",
+    scores: { session: 0.7, actor: 0.8, authGroup: 0.6 },
+  });
+  store.updateAttackScoreHistory({
+    sessionId,
+    actorId: session.actorId,
+    authGroupId: "auth:crs-history-test",
+    scores: { session: 0.1, actor: 0.2, authGroup: 0.1 },
+  });
+  assert.equal(session.attackHistory.maxAttackScore, 0.7);
+  assert.equal(store.getActor(session.actorId).attackHistory.maxAttackScore, 0.8);
+  assert.equal(store.getActor(session.actorId).attackHistory.cumulativeRuleHits, 2);
+  assert.equal(store.getAuthGroup("auth:crs-history-test").attackHistory.maxAttackScore, 0.6);
+  assert.equal(store.getAuthGroup("auth:crs-history-test").attackHistory.cumulativeRuleHits, 2);
 });
