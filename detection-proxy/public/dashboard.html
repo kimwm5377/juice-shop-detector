@@ -68,7 +68,6 @@
   .score-fill { display:block; height:100%; }
   .score-fill.automation { background:#b06b16; }
   .score-fill.attack { background:#b83a32; }
-  .score-fill.deception { background:#7657b5; }
   .modal-backdrop { display:none; position:fixed; inset:0; background:rgba(30,39,48,.55); z-index:10; padding:24px; }
   .modal { width:min(1120px,100%); max-height:calc(100vh - 48px); overflow:auto; margin:0 auto; background:var(--surface); border:1px solid var(--border-strong); box-shadow:0 12px 36px rgba(0,0,0,.28); }
   .modal-header { position:sticky; top:0; z-index:2; display:flex; justify-content:space-between; align-items:flex-start; gap:20px; padding:18px 22px; border-bottom:1px solid var(--border); background:var(--surface); }
@@ -130,7 +129,7 @@
   </header>
 
   <main class="page">
-    <p class="notice"><strong>판정 기준 안내:</strong> Automation Score(자동화 점수), Attack Score(공격 점수), Deception Evidence(미끼 반응 근거)는 확률이 아닌 휴리스틱 지표입니다. Deception은 같은 신호를 반복해도 고유 신호 1회만 정규화 값에 반영하며 실제 횟수는 별도로 보존합니다.</p>
+    <p class="notice"><strong>판정 기준 안내:</strong> Automation Score(자동화 점수)와 Attack Score(공격 점수)는 확률이 아닌 휴리스틱 지표입니다. 각 점수의 35%에는 해당 Honey 신호가 포함되며, 같은 신호를 반복해도 점수에는 한 번만 반영하고 실제 횟수는 별도로 보존합니다.</p>
 
     <section class="summary-grid" aria-label="트래픽 요약">
       <div class="summary-item"><span class="summary-label">Sessions (세션)</span><strong class="summary-value" id="summarySessions">—</strong></div>
@@ -150,7 +149,7 @@
       <div class="tab-panel active" id="panel-actors" role="tabpanel">
         <div class="section-head"><div><h2>Actor Candidates (행위자 후보)</h2><p class="sub">IP와 HTTP Header Fingerprint로 묶은 추정 클라이언트 흐름이며 실제 사용자 식별자가 아닙니다.</p></div></div>
         <div class="table-wrap"><table><thead><tr>
-          <th>Actor Candidate (행위자 후보)</th><th>IP</th><th>Fingerprint (지문)</th><th>Automation Score (자동화 점수)</th><th>Attack Score (공격 점수)</th><th>Deception Evidence (미끼 반응)</th><th>Attack History (누적 공격 이력)</th>
+          <th>Actor Candidate (행위자 후보)</th><th>IP</th><th>Fingerprint (지문)</th><th>Automation Score (자동화 점수)</th><th>Attack Score (공격 점수)</th><th>Honey Signals (허니 신호)</th><th>Attack History (누적 공격 이력)</th>
           <th>Requests (요청)</th><th>Sessions (세션)</th><th>Last Seen (최근 관찰)</th>
         </tr></thead><tbody id="actorRows"></tbody></table></div>
       </div>
@@ -158,7 +157,7 @@
       <div class="tab-panel" id="panel-sessions" role="tabpanel" hidden>
         <div class="section-head"><div><h2>Sessions (세션)</h2><p class="sub">단일 dlsid 흐름만 표시하며 IP 전체 요청은 섞이지 않습니다.</p></div></div>
         <div class="table-wrap"><table><thead><tr>
-          <th>Session (세션)</th><th>IP</th><th>Automation Score (자동화 점수)</th><th>Attack Score (공격 점수)</th><th>Deception Evidence (미끼 반응)</th><th>Attack History (누적 공격 이력)</th>
+          <th>Session (세션)</th><th>IP</th><th>Automation Score (자동화 점수)</th><th>Attack Score (공격 점수)</th><th>Honey Signals (허니 신호)</th><th>Attack History (누적 공격 이력)</th>
           <th>Requests (요청)</th><th>Avg Interval (평균 간격, ms)</th><th>2s Max (2초 최대)</th><th>10s Requests (10초 요청)</th><th>404 Ratio (404 비율)</th><th>401/403 Ratio (접근 거부 비율)</th>
         </tr></thead><tbody id="sessionRows"></tbody></table></div>
       </div>
@@ -166,7 +165,7 @@
       <div class="tab-panel" id="panel-auth" role="tabpanel" hidden>
         <div class="section-head"><div><h2>Auth Groups (인증 그룹)</h2><p class="sub">동일 Bearer Token의 SHA-256 해시 기준입니다. 인증 토큰 원문은 저장하지 않습니다.</p></div></div>
         <div class="table-wrap"><table><thead><tr>
-          <th>Auth Group (인증 그룹)</th><th>Automation Score (자동화 점수)</th><th>Attack Score (공격 점수)</th><th>Deception Evidence (미끼 반응)</th><th>Attack History (누적 공격 이력)</th>
+          <th>Auth Group (인증 그룹)</th><th>Automation Score (자동화 점수)</th><th>Attack Score (공격 점수)</th><th>Honey Signals (허니 신호)</th><th>Attack History (누적 공격 이력)</th>
           <th>Requests (요청)</th><th>Sessions (세션)</th><th>Actors (행위자 후보)</th><th>Last Seen (최근 관찰)</th>
         </tr></thead><tbody id="authRows"></tbody></table></div>
       </div>
@@ -282,13 +281,16 @@ const metricLabels = {
   attackCategories: 'Cumulative Attack Categories (누적 공격 유형)',
   firstAttackAt: 'First Attack At (최초 탐지 시각)',
   lastAttackAt: 'Last Attack At (최근 탐지 시각)',
+  automationHoney: 'Automation Honey (자동화 허니)',
+  attackHoney: 'Attack Honey (공격 허니)',
+  recentUniqueApiPaths: 'Recent Unique API Paths (최근 고유 API 경로)',
+  coverageEligible: 'Coverage Scoring Eligible (Coverage 점수 조건)',
   errorToEndpointChangeCount: 'Error → Endpoint Change (오류 후 엔드포인트 변경)',
   errorToMethodChangeCount: 'Error → Method Change (오류 후 메서드 변경)',
   retryWithPayloadChangeCount: 'Retry + Payload Change (페이로드 변경 재시도)',
   authAddedAfter401Count: '401 → Authorization Added (401 후 인증 추가)',
   failureChangeSuccessCount: 'Failure → Change → Success (실패 후 변경 및 성공)',
-  hasEvidence: 'Deception Evidence Present (미끼 반응 근거)',
-  evidenceScore: 'Deception Evidence Index (미끼 반응 지표)',
+  hasEvidence: 'Honey Signal Present (허니 신호 존재)',
   totalEvents: 'Total Deception Events (전체 미끼 이벤트)',
   distinctSignals: 'Distinct Deception Signals (고유 미끼 신호)',
   distinctScoredSignals: 'Scored Deception Signals (정규화 반영 신호)',
@@ -313,9 +315,10 @@ function attackHistoryCell(history) {
   if (!history?.hasAttackHistory) return '<span class="status-success">없음</span>';
   return `<span class="status-error">있음</span> · ${Number(history.cumulativeRuleHits || 0)} hit`;
 }
-function deceptionHistoryCell(history) {
+function honeySignalsCell(history) {
   if (!history?.hasEvidence) return '<span class="status-success">없음</span>';
-  return `${scoreCell(history.evidenceScore,'deception')} · ${Number(history.totalEvents || 0)} event`;
+  const signals = history.distinctSignals || [];
+  return `${escapeHtml(signals.join(', ') || '관찰값')} · ${Number(history.totalEvents || 0)} event`;
 }
 function fixed(value, digits = 2) { return Number(value || 0).toFixed(digits); }
 function statusClass(status) {
@@ -376,29 +379,29 @@ async function refresh() {
   updateSummary(sessions, actors, authGroups, ipEntries);
 
   document.getElementById('sessionRows').innerHTML = sessions
-    .sort((a,b) => Math.max(b.attackScore,b.automationScore,b.deceptionHistory?.evidenceScore || 0)-Math.max(a.attackScore,a.automationScore,a.deceptionHistory?.evidenceScore || 0))
+    .sort((a,b) => Math.max(b.attackScore,b.automationScore)-Math.max(a.attackScore,a.automationScore))
     .map(s => `<tr ${rowAttrs('sessions', s.sessionId)}>
       <td><code>${escapeHtml(s.sessionId.slice(0,8))}</code></td><td>${escapeHtml(s.ip)}</td>
-      <td>${scoreCell(s.automationScore,'automation')}</td><td>${scoreCell(s.attackScore,'attack')}</td><td>${deceptionHistoryCell(s.deceptionHistory)}</td><td>${attackHistoryCell(s.attackHistory)}</td>
+      <td>${scoreCell(s.automationScore,'automation')}</td><td>${scoreCell(s.attackScore,'attack')}</td><td>${honeySignalsCell(s.deceptionHistory)}</td><td>${attackHistoryCell(s.attackHistory)}</td>
       <td>${s.features.totalRequests}</td><td>${fixed(s.features.temporal.avgIntervalMs,0)}</td>
       <td>${s.features.temporal.maxRequests2s}</td><td>${s.features.temporal.requests10s}</td>
       <td>${fixed(s.features.exploration.notFoundRatio)}</td><td>${fixed(s.features.exploration.accessDeniedRatio)}</td>
     </tr>`).join('');
 
   document.getElementById('actorRows').innerHTML = actors
-    .sort((a,b) => Math.max(b.attackScore,b.automationScore,b.deceptionHistory?.evidenceScore || 0)-Math.max(a.attackScore,a.automationScore,a.deceptionHistory?.evidenceScore || 0))
+    .sort((a,b) => Math.max(b.attackScore,b.automationScore)-Math.max(a.attackScore,a.automationScore))
     .map(a => `<tr ${rowAttrs('actors', a.actorId)}>
       <td><code>${escapeHtml(a.actorId.slice(0,18))}…</code></td><td>${escapeHtml(a.ip)}</td>
       <td><code>${escapeHtml(a.fingerprint)}</code></td>
-      <td>${scoreCell(a.automationScore,'automation')}</td><td>${scoreCell(a.attackScore,'attack')}</td><td>${deceptionHistoryCell(a.deceptionHistory)}</td><td>${attackHistoryCell(a.attackHistory)}</td>
+      <td>${scoreCell(a.automationScore,'automation')}</td><td>${scoreCell(a.attackScore,'attack')}</td><td>${honeySignalsCell(a.deceptionHistory)}</td><td>${attackHistoryCell(a.attackHistory)}</td>
       <td>${a.totalRequests}</td><td>${a.sessionCount}</td><td>${new Date(a.lastSeen).toLocaleString()}</td>
     </tr>`).join('');
 
   document.getElementById('authRows').innerHTML = authGroups
-    .sort((a,b) => Math.max(b.attackScore,b.automationScore,b.deceptionHistory?.evidenceScore || 0)-Math.max(a.attackScore,a.automationScore,a.deceptionHistory?.evidenceScore || 0))
+    .sort((a,b) => Math.max(b.attackScore,b.automationScore)-Math.max(a.attackScore,a.automationScore))
     .map(g => `<tr ${rowAttrs('auth-groups', g.authGroupId)}>
       <td><code>${escapeHtml(g.authGroupId.slice(0,17))}…</code></td>
-      <td>${scoreCell(g.automationScore,'automation')}</td><td>${scoreCell(g.attackScore,'attack')}</td><td>${deceptionHistoryCell(g.deceptionHistory)}</td><td>${attackHistoryCell(g.attackHistory)}</td>
+      <td>${scoreCell(g.automationScore,'automation')}</td><td>${scoreCell(g.attackScore,'attack')}</td><td>${honeySignalsCell(g.deceptionHistory)}</td><td>${attackHistoryCell(g.attackHistory)}</td>
       <td>${g.totalRequests}</td><td>${g.sessionCount}</td><td>${g.actorCount}</td>
       <td>${new Date(g.lastSeen).toLocaleString()}</td>
     </tr>`).join('');
@@ -458,12 +461,10 @@ function renderAttackHistory(history) {
 
 function renderDeceptionHistory(history) {
   const source = history || {};
-  const summary = metricPanel('Deception Evidence (미끼 반응 근거 · 별도 정규화)', {
+  const summary = metricPanel('Honey Signals (허니 신호 근거 · Automation/Attack 점수에 포함)', {
     hasEvidence: source.hasEvidence ? '있음' : '없음',
-    evidenceScore: scoreNumber(source.evidenceScore),
     totalEvents: source.totalEvents || 0,
     distinctSignals: source.distinctSignals || [],
-    distinctScoredSignals: source.distinctScoredSignals || [],
     signalCounts: source.signalCounts || {},
     strongestEvidenceLevel: source.strongestEvidenceLevel || '—',
     firstEventAt: source.firstEventAt ? new Date(source.firstEventAt).toLocaleString() : '—',
@@ -474,7 +475,24 @@ function renderDeceptionHistory(history) {
     <div class="url">${escapeHtml(event.detail || '')}</div>
     ${event.originSessionId ? `<div class="meta">origin session <code>${escapeHtml(event.originSessionId.slice(0,8))}</code></div>` : ''}
   </div>`).join('') || '<p class="empty">기록된 미끼 이벤트가 없습니다.</p>';
-  return `${summary}<div class="panel"><h3>Recent Deception Events (최근 미끼 이벤트)</h3>${events}</div>`;
+  return `${summary}<div class="panel"><h3>Recent Honey Events (최근 허니 이벤트)</h3>${events}</div>`;
+}
+
+function renderHoneyBreakdown(honeyBreakdown) {
+  const automation = honeyBreakdown?.automation || {};
+  const attack = honeyBreakdown?.attack || {};
+  return `<div class="feature-grid">
+    ${metricPanel('Automation Honey 배점 · 최대 35점', {
+      totalPoints: automation.totalPoints || 0,
+      maximumPoints: automation.maximumPoints || 35,
+      contributions: automation.contributions || {}
+    })}
+    ${metricPanel('Attack Honey 배점 · 최대 35점', {
+      totalPoints: attack.totalPoints || 0,
+      maximumPoints: attack.maximumPoints || 35,
+      contributions: attack.contributions || {}
+    })}
+  </div>`;
 }
 
 function renderRequests(requests) {
@@ -507,17 +525,13 @@ async function openDetail(kind, id) {
     <div class="score-grid">
       ${metricPanel(`Automation Score (자동화 점수) · ${scoreNumber(data.automationScore)}`, data.automationBreakdown)}
       ${metricPanel(`Attack Score (공격 점수) · ${scoreNumber(data.attackScore)}`, data.attackBreakdown)}
-      ${metricPanel(`Deception Evidence (미끼 반응 근거) · ${scoreNumber(data.deceptionHistory?.evidenceScore)}`, {
-        distinctScoredSignals: data.deceptionHistory?.distinctScoredSignals || [],
-        totalEvents: data.deceptionHistory?.totalEvents || 0,
-        strongestEvidenceLevel: data.deceptionHistory?.strongestEvidenceLevel || '—'
-      })}
     </div>`;
   const features = data.features || {};
   const sequence = features.behavior?.recentSequence || [];
   const agentic = observationOnly ? null : data.agenticEvidence;
   document.getElementById('detailContent').innerHTML = `
     ${scoreHtml}
+    ${observationOnly ? '' : renderHoneyBreakdown(data.honeyBreakdown)}
     ${observationOnly ? '' : renderAttackHistory(data.attackHistory)}
     ${observationOnly ? '' : renderDeceptionHistory(data.deceptionHistory)}
     <div class="feature-grid">
@@ -525,6 +539,7 @@ async function openDetail(kind, id) {
       ${metricPanel('Behavior Features (요청 행동 특성)', Object.fromEntries(Object.entries(features.behavior || {}).filter(([key]) => key !== 'recentSequence')))}
       ${metricPanel('Exploration Features (탐색 특성)', features.exploration)}
       ${metricPanel('Client Features (클라이언트 특성)', features.client)}
+      ${metricPanel('Honey Features (허니 특성)', features.deception)}
       ${metricPanel('Attack Features (공격 특성)', features.attack)}
     </div>
     <div class="panel"><h3>Recent Sequence (최근 요청 순서 · 관찰 전용)</h3><ol class="sequence">

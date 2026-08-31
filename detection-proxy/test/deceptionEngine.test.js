@@ -3,7 +3,6 @@ const test = require("node:test");
 
 const {
   DeceptionEngine,
-  SCORED_DECEPTION_SIGNALS,
 } = require("../lib/deceptionEngine");
 const store = require("../lib/sessionStore");
 
@@ -81,7 +80,7 @@ test("트랩 링크, 쓰기 가능 파일과 스크립트 경로를 Node 내부 
   assert.match(script.body, /maintenance mode enabled temporarily/);
 });
 
-test("coverage와 no_asset_loading은 발생하지만 정규화 점수 대상에서는 제외한다", () => {
+test("coverage와 no_asset_loading은 Automation Honey 후보 신호로 발생한다", () => {
   const deception = engine();
   const events = [];
   for (const path of ["/api/a", "/api/b", "/api/c", "/page/d", "/page/e"]) {
@@ -92,11 +91,11 @@ test("coverage와 no_asset_loading은 발생하지만 정규화 점수 대상에
     }));
   }
 
-  assert.ok(events.some((event) => event.signal === "no_asset_loading" && !event.scored));
-  assert.ok(events.some((event) => event.signal === "coverage" && !event.scored));
+  assert.ok(events.some((event) => event.signal === "no_asset_loading" && event.scored));
+  assert.ok(events.some((event) => event.signal === "coverage" && event.scored));
 });
 
-test("같은 미끼 신호 반복은 횟수만 늘리고 Deception Evidence 정규화 값은 한 번만 반영한다", () => {
+test("같은 미끼 신호 반복은 횟수만 늘리고 고유 신호는 한 번만 보존한다", () => {
   const sessionId = `deception-history-${Date.now()}`;
   const event = {
     eventId: "event-1",
@@ -126,5 +125,5 @@ test("같은 미끼 신호 반복은 횟수만 늘리고 Deception Evidence 정�
   assert.equal(history.totalEvents, 2);
   assert.equal(history.signalCounts.trap_trigger, 2);
   assert.deepEqual(history.distinctScoredSignals, ["trap_trigger"]);
-  assert.equal(history.evidenceScore, Number((1 / SCORED_DECEPTION_SIGNALS.length).toFixed(3)));
+  assert.equal(history.evidenceScore, undefined);
 });

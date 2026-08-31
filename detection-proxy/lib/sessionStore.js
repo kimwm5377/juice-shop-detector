@@ -1,6 +1,6 @@
 const crypto = require("crypto");
 const { normalizePath } = require("./requestMetadata");
-const { DECEPTION_SIGNAL_CATALOG, SCORED_DECEPTION_SIGNALS } = require("./deceptionEngine");
+const { DECEPTION_SIGNAL_CATALOG } = require("./deceptionEngine");
 
 // 세션 단위 데이터: 요청 로그 + 클라이언트 텔레메트리
 const sessions = new Map();
@@ -38,7 +38,6 @@ function emptyAttackHistory() {
 function emptyDeceptionHistory() {
   return {
     hasEvidence: false,
-    evidenceScore: 0,
     totalEvents: 0,
     distinctSignals: [],
     distinctScoredSignals: [],
@@ -97,9 +96,6 @@ function recordDeceptionHistory(entity, events, timestamp) {
       history.recentEvents.shift();
     }
   }
-  history.evidenceScore = Number(
-    (history.distinctScoredSignals.length / SCORED_DECEPTION_SIGNALS.length).toFixed(3)
-  );
   return true;
 }
 
@@ -366,7 +362,7 @@ function recordRequest(
   recordCrsAttackHistory(s, attackDetection, now);
   recordCrsAttackHistory(actor, attackDetection, now);
   if (authGroupId) recordCrsAttackHistory(authGroups.get(authGroupId), attackDetection, now);
-  // 동일 신호가 반복돼도 evidenceScore에는 고유 신호 1회만 반영하고 실제 횟수는 보존한다.
+  // 점수에는 고유 신호만 사용하고 여기서는 반복 횟수와 근거 이력을 함께 보존한다.
   recordDeceptionHistory(s, deceptionEvents, now);
   recordDeceptionHistory(actor, deceptionEvents, now);
   if (authGroupId) recordDeceptionHistory(authGroups.get(authGroupId), deceptionEvents, now);

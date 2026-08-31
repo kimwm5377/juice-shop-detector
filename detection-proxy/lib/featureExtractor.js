@@ -78,6 +78,7 @@ function extractStreamFeatures({
   firstSeen,
   lastSeen,
   sessionChurn,
+  deceptionHistory = null,
 }) {
   const ordered = [...requests].sort((a, b) => a.ts - b.ts);
   const timingRequests = recent(ordered, FEATURE_WINDOWS.timingRequests);
@@ -106,6 +107,11 @@ function extractStreamFeatures({
 
   const diversityRequests = recent(ordered, FEATURE_WINDOWS.diversityRequests);
   const uniquePaths = new Set(diversityRequests.map((request) => request.normalizedPath));
+  const uniqueApiPaths = new Set(
+    diversityRequests
+      .filter((request) => /^\/(?:api|rest)\//.test(request.normalizedPath || ""))
+      .map((request) => request.normalizedPath)
+  );
 
   const errorRequests = recent(ordered, FEATURE_WINDOWS.errorRequests);
   const notFoundCount = errorRequests.filter((request) => request.status === 404).length;
@@ -123,6 +129,10 @@ function extractStreamFeatures({
   const automationUA = headerObservationAvailable ? isAutomationUA(ua) : false;
   const missingHeaders = headerObservationAvailable ? missingBrowserHeaders(headers) : [];
   const interaction = telemetry || emptyTelemetry();
+  const deceptionSignals = Array.from(
+    new Set(deceptionHistory?.distinctSignals || [])
+  );
+  const deceptionSignalCounts = { ...(deceptionHistory?.signalCounts || {}) };
 
   const attackRequests = recent(ordered, FEATURE_WINDOWS.attackRequests);
   const allTags = attackRequests.flatMap((request) => request.tags || []);
@@ -189,6 +199,15 @@ function extractStreamFeatures({
         hasTelemetry: interaction.lastTelemetryAt !== null,
       },
     },
+    deception: {
+      distinctSignals: deceptionSignals,
+      signalCounts: deceptionSignalCounts,
+      recentUniqueApiPaths: uniqueApiPaths.size,
+      coverageEligible:
+        deceptionSignals.includes("no_asset_loading") ||
+        automationUA ||
+        interaction.lastTelemetryAt === null,
+    },
     attack: {
       sampleSize: attackRequests.length,
       payloadSignatureHits: allTags.length,
@@ -215,6 +234,7 @@ function extractFeatures(session) {
     firstSeen: session.firstSeen,
     lastSeen: session.lastSeen,
     sessionChurn: 1,
+    deceptionHistory: session.deceptionHistory,
   });
 }
 
@@ -229,6 +249,7 @@ function extractActorFeatures(actor, getSession) {
     firstSeen: actor.firstSeen,
     lastSeen: actor.lastSeen,
     sessionChurn: actor.sessionIds.size,
+    deceptionHistory: actor.deceptionHistory,
   });
 }
 
@@ -244,6 +265,7 @@ function extractAuthGroupFeatures(group, getSession) {
     firstSeen: group.firstSeen,
     lastSeen: group.lastSeen,
     sessionChurn: group.sessionIds.size,
+    deceptionHistory: group.deceptionHistory,
   });
 }
 

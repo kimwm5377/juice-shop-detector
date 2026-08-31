@@ -2,18 +2,35 @@
 const clamp = (value, low = 0, high = 1) => Math.min(high, Math.max(low, value));
 
 const AUTOMATION_WEIGHTS = Object.freeze({
-  timingRegularity: 0.2,
-  requestIntensity: 0.2,
-  repeatedOperation: 0.15,
+  timingRegularity: 0.05,
+  requestIntensity: 0.05,
+  repeatedOperation: 0.1,
   sessionChurn: 0.1,
   headerAnomaly: 0.15,
   browserInteraction: 0.2,
+  automationHoney: 0.35,
 });
 
 const ATTACK_WEIGHTS = Object.freeze({
-  payloadSignature: 0.7,
-  notFoundExploration: 0.15,
-  accessDeniedExploration: 0.15,
+  payloadSignature: 0.55,
+  notFoundExploration: 0.05,
+  accessDeniedExploration: 0.05,
+  attackHoney: 0.35,
+});
+
+const AUTOMATION_HONEY_MAX_POINTS = 35;
+const ATTACK_HONEY_MAX_POINTS = 35;
+const AUTOMATION_HONEY_POINTS = Object.freeze({
+  trap_trigger: 20,
+  no_asset_loading: 8,
+});
+const ATTACK_HONEY_POINTS = Object.freeze({
+  watermark_reuse: 20,
+  writable_file_write: 20,
+  ssh_cred_reuse: 12,
+  password_list_reuse: 12,
+  writable_file_found: 8,
+  script_hint_access: 5,
 });
 
 // Ground truth 실험 후 교체할 임시 정규화 기준이다.
@@ -101,6 +118,46 @@ function scoreAccessDeniedExploration(features) {
   return clamp(features.exploration.accessDeniedRatio / NORMALIZATION.errorRatioHigh);
 }
 
+function hasDeceptionSignal(features, signal) {
+  return (features.deception?.distinctSignals || []).includes(signal);
+}
+
+function coverageHoneyPoints(features) {
+  if (!features.deception?.coverageEligible) return 0;
+  const count = Number(features.deception.recentUniqueApiPaths) || 0;
+  if (count >= 20) return 7;
+  if (count >= 15) return 5;
+  if (count >= 10) return 3;
+  return 0;
+}
+
+function honeyScore(features, pointMap, maximumPoints, extraPoints = {}) {
+  const contributions = {};
+  for (const [signal, points] of Object.entries(pointMap)) {
+    contributions[signal] = hasDeceptionSignal(features, signal) ? points : 0;
+  }
+  Object.assign(contributions, extraPoints);
+  const rawPoints = Object.values(contributions).reduce((sum, points) => sum + points, 0);
+  const totalPoints = Math.min(maximumPoints, rawPoints);
+  return {
+    score: totalPoints / maximumPoints,
+    totalPoints,
+    rawPoints,
+    maximumPoints,
+    contributions,
+  };
+}
+
+function scoreAutomationHoney(features) {
+  return honeyScore(features, AUTOMATION_HONEY_POINTS, AUTOMATION_HONEY_MAX_POINTS, {
+    coverage: coverageHoneyPoints(features),
+  });
+}
+
+function scoreAttackHoney(features) {
+  return honeyScore(features, ATTACK_HONEY_POINTS, ATTACK_HONEY_MAX_POINTS);
+}
+
 function weightedScore(breakdown, weights) {
   return Number(
     Object.entries(weights)
@@ -110,6 +167,8 @@ function weightedScore(breakdown, weights) {
 }
 
 function classify(features) {
+  const automationHoney = scoreAutomationHoney(features);
+  const attackHoney = scoreAttackHoney(features);
   const automationBreakdown = {
     timingRegularity: scoreTimingRegularity(features),
     requestIntensity: scoreRequestIntensity(features),
@@ -117,11 +176,13 @@ function classify(features) {
     sessionChurn: scoreSessionChurn(features),
     headerAnomaly: scoreHeaderAnomaly(features),
     browserInteraction: scoreBrowserInteraction(features),
+    automationHoney: automationHoney.score,
   };
   const attackBreakdown = {
     payloadSignature: scorePayloadSignature(features),
     notFoundExploration: scoreNotFoundExploration(features),
     accessDeniedExploration: scoreAccessDeniedExploration(features),
+    attackHoney: attackHoney.score,
   };
 
   return {
@@ -130,6 +191,10 @@ function classify(features) {
     attackScore: weightedScore(attackBreakdown, ATTACK_WEIGHTS),
     automationBreakdown,
     attackBreakdown,
+    honeyBreakdown: {
+      automation: automationHoney,
+      attack: attackHoney,
+    },
   };
 }
 
@@ -137,5 +202,9 @@ module.exports = {
   classify,
   AUTOMATION_WEIGHTS,
   ATTACK_WEIGHTS,
+  AUTOMATION_HONEY_POINTS,
+  ATTACK_HONEY_POINTS,
+  scoreAutomationHoney,
+  scoreAttackHoney,
   NORMALIZATION,
 };

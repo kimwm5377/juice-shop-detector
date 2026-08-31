@@ -33,15 +33,15 @@ const API_ASSET_THRESHOLD = 3;
 const COVERAGE_MILESTONES = new Set([5, 10, 15, 20, 25]);
 
 const DECEPTION_SIGNAL_CATALOG = Object.freeze({
-  watermark_reuse: { evidenceLevel: "strong", scored: true },
-  ssh_cred_reuse: { evidenceLevel: "medium", scored: true },
-  password_list_reuse: { evidenceLevel: "medium", scored: true },
-  writable_file_write: { evidenceLevel: "strong", scored: true },
-  writable_file_found: { evidenceLevel: "medium", scored: true },
-  trap_trigger: { evidenceLevel: "supporting", scored: true },
-  script_hint_access: { evidenceLevel: "supporting", scored: true },
-  no_asset_loading: { evidenceLevel: "observation", scored: false },
-  coverage: { evidenceLevel: "observation", scored: false },
+  watermark_reuse: { evidenceLevel: "strong", scored: true, scoreTarget: "attack" },
+  ssh_cred_reuse: { evidenceLevel: "medium", scored: true, scoreTarget: "attack" },
+  password_list_reuse: { evidenceLevel: "medium", scored: true, scoreTarget: "attack" },
+  writable_file_write: { evidenceLevel: "strong", scored: true, scoreTarget: "attack" },
+  writable_file_found: { evidenceLevel: "medium", scored: true, scoreTarget: "attack" },
+  trap_trigger: { evidenceLevel: "supporting", scored: true, scoreTarget: "automation" },
+  script_hint_access: { evidenceLevel: "supporting", scored: true, scoreTarget: "attack" },
+  no_asset_loading: { evidenceLevel: "observation", scored: true, scoreTarget: "automation" },
+  coverage: { evidenceLevel: "observation", scored: true, scoreTarget: "automation-conditional" },
 });
 
 const SCORED_DECEPTION_SIGNALS = Object.freeze(
@@ -131,15 +131,19 @@ class DeceptionEngine {
   status() {
     return {
       enabled: this.enabled,
-      mode: "observation-only",
+      mode: "score-integrated-detection-only",
       tokenTtlMs: this.tokenTtlMs,
       activeSessionTokens: this.sessionStates.size,
       source: "team detection/proxy/detect_proxy/Detect_proxy.py",
       sourceCommit: "4e0e791",
       scoredSignals: SCORED_DECEPTION_SIGNALS,
-      observationOnlySignals: Object.entries(DECEPTION_SIGNAL_CATALOG)
-        .filter(([, metadata]) => !metadata.scored)
+      automationSignals: Object.entries(DECEPTION_SIGNAL_CATALOG)
+        .filter(([, metadata]) => metadata.scoreTarget.startsWith("automation"))
         .map(([signal]) => signal),
+      attackSignals: Object.entries(DECEPTION_SIGNAL_CATALOG)
+        .filter(([, metadata]) => metadata.scoreTarget === "attack")
+        .map(([signal]) => signal),
+      conditionalSignals: ["coverage"],
     };
   }
 

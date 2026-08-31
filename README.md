@@ -49,21 +49,19 @@ docker compose up --build
 | Exploration | 최근 50개 요청의 404 비율과 401/403 비율 | Attack |
 | Client | Session churn, Header anomaly, 통합 Browser interaction | Automation |
 | Attack | 최근 50개 요청의 OWASP CRS 규칙 탐지 결과와 SQLi/XSS/Traversal 등 공격 유형 | Attack |
-| Deception | 워터마크·미끼 자격증명 재사용, 트랩·미끼 파일·스크립트 접근 | 별도 Deception Evidence |
+| Honey/Deception | 자동화형 트랩·coverage와 공격형 워터마크·미끼 자격증명·파일 반응 | Automation/Attack에 각각 최대 35% |
 
-Automation Score는 Timing 20%, Intensity 20%, Repeated Operation 15%, Session Churn 10%,
-Header Anomaly 15%, Browser Interaction 20%로 구성됩니다. Attack Score는 Payload Signature
-70%, 404 Exploration 15%, 401/403 Exploration 15%로 구성됩니다. Sequence와 Path Diversity는
-실험 데이터가 확보되기 전까지 점수화하지 않습니다.
+Automation Score는 Timing 5%, Intensity 5%, Repeated Operation 10%, Session Churn 10%,
+Header Anomaly 15%, Browser Interaction 20%, Automation Honey 35%로 구성됩니다. Attack Score는
+Payload Signature 55%, 404 Exploration 5%, 401/403 Exploration 5%, Attack Honey 35%로
+구성됩니다. Sequence는 점수화하지 않습니다.
 
 각 점수는 0~1 내부값을 Dashboard에서 0~100 Score로 표시하는 실험 전 휴리스틱이며 확률이 아닙니다.
 Agentic Evidence도 원시 count로만 제공하며 별도 점수, 가중치, AI Agent 라벨을 생성하지 않습니다.
 
-Deception Evidence도 AI 여부나 공격 확률이 아닙니다. 팀원이 제공한 미끼 콘텐츠에 반응한 행위의
-종류를 나타내며, 같은 신호가 반복돼도 정규화 값에는 고유 신호 1회만 반영합니다. 반복 횟수는
-`signalCounts`와 `totalEvents`에 별도로 보존합니다. `coverage`와 `no_asset_loading`은 기존 경로
-다양성·브라우저 상호작용 Feature와 일부 겹치고 정상 API 클라이언트 오탐 가능성이 있어 정규화
-대상에서 제외한 관찰값입니다.
+Honey 신호도 AI 여부나 공격 확률의 증명이 아닙니다. 팀원이 제공한 미끼 콘텐츠에 반응한 행위를
+Automation 또는 Attack의 보조 근거로 반영합니다. 같은 신호가 반복돼도 점수에는 고유 신호 1회만
+반영하고 반복 횟수는 `signalCounts`와 `totalEvents`에 별도로 보존합니다.
 
 브라우저 텔레메트리는 문서와 내부 요소의 스크롤을 capture 단계에서 수집합니다. SPA 화면 이동은
 `history.pushState`, `history.replaceState`, `popstate`, `hashchange`를 관찰하며, 현재 URL에는
@@ -124,14 +122,14 @@ multipart·바이너리 요청은 `null`일 수 있습니다. `responseBodyBytes
 필요하면 Redis나 데이터베이스 저장을 추가해야 합니다. 대시보드 목록의 `Attack History`와
 각 상세 화면에서 현재 점수와 누적 이력을 분리해 확인할 수 있습니다.
 
-CRS는 JSON과 URL-encoded 원문 본문을 최대 1 MiB까지 검사하며 URI와 비민감 헤더는 요청 형식과
+CRS는 `application/json`, `application/*+json`, URL-encoded 원문 본문을 최대 1 MiB까지 검사하며 URI와 비민감 헤더는 요청 형식과
 무관하게 검사합니다. 현재 스트림을 별도로 복제하지 않는 multipart·임의 바이너리 요청은 URI와
 헤더만 CRS 검사 대상이며 본문 검사는 추후 보완 범위입니다. `CRS_MAX_BODY_BYTES`와
 `CRS_SCAN_TIMEOUT_MS`로 상한을 조정할 수 있습니다.
 
-이번 연동은 기존 `AUTOMATION_WEIGHTS`, `ATTACK_WEIGHTS`, 정규화 수치와 차단 동작을 변경하지
-않았습니다. CRS는 기존 payload signature의 입력 출처를 범용 규칙으로 확장하고, 누적 이력은
-현재 점수와 별도 관찰값으로 제공합니다.
+CRS는 기존 payload signature의 입력 출처를 범용 규칙으로 확장하고, 누적 이력은 현재 점수와
+별도 관찰값으로 제공합니다. Honey 통합에 따라 `AUTOMATION_WEIGHTS`와 `ATTACK_WEIGHTS`는 각각
+기존 Feature 65%, Honey 35% 구조로 조정했습니다.
 
 ## 통합 Honey/Deception 탐지
 
@@ -144,16 +142,21 @@ CRS는 JSON과 URL-encoded 원문 본문을 최대 1 MiB까지 검사하며 URI�
 - `trap_trigger`: 세션별 토큰이 포함된 off-screen 링크에 접근함
 - `writable_file_found`, `writable_file_write`: 미끼 설정 파일 조회·쓰기 시도
 - `script_hint_access`: HTML에 언급된 미끼 유지보수 스크립트 접근
-- `coverage`, `no_asset_loading`: 관찰 전용이며 Deception Evidence 정규화에서 제외
+- `no_asset_loading`, `trap_trigger`: Automation Honey에 반영
+- `coverage`: 최근 50개 요청의 고유 API 경로가 10개 이상이고 자동화 정황이 있을 때 Automation Honey에 조건부 반영
+- 나머지 워터마크·자격증명·파일·스크립트 신호: Attack Honey에 반영
 
 세션별 워터마크는 전역 토큰 registry에 발급 세션을 보존하므로 curl이 `dlsid`를 재사용하지 않아도
 본문에 워터마크가 있으면 원래 발급 세션을 `originSessionId`로 연결할 수 있습니다. registry와
 Deception 이력은 현재 인메모리이므로 프로세스 재시작 후에는 초기화됩니다. 원문 워터마크는
 이벤트 detail과 요청 body 로그에서 `[DECEPTION_WATERMARK_REDACTED]`로 대체합니다.
 
-Deception Evidence는 점수 대상 7개 신호 중 관찰된 고유 신호 비율입니다. 예를 들어 같은
-`trap_trigger`가 4번 발생해도 `totalEvents`는 4 증가하지만 정규화 값에는 1개 신호만 반영됩니다.
-이 값은 Automation Score·Attack Score와 합산하지 않으며 차단에도 사용하지 않습니다.
+Automation Honey는 `trap_trigger` 20점, `no_asset_loading` 8점, 조건부 `coverage` 최대 7점으로
+최대 35점입니다. Attack Honey는 `watermark_reuse` 20점, `writable_file_write` 20점,
+`ssh_cred_reuse`·`password_list_reuse` 각 12점, `writable_file_found` 8점,
+`script_hint_access` 5점을 합산해 최대 35점으로 제한합니다. 예를 들어 같은 `trap_trigger`가
+4번 발생해도 Automation Score에는 20점만 반영되고 `totalEvents`와 `signalCounts`에는 실제
+4회가 보존됩니다.
 
 ```yaml
 environment:
