@@ -1,5 +1,6 @@
 const crypto = require("crypto");
 const { normalizePath } = require("./requestMetadata");
+const { DECEPTION_SIGNAL_CATALOG, SCORED_DECEPTION_SIGNALS } = require("./deceptionEngine");
 
 // 세션 단위 데이터: 요청 로그 + 클라이언트 텔레메트리
 const sessions = new Map();
@@ -32,6 +33,74 @@ function emptyAttackHistory() {
     firstAttackAt: null,
     lastAttackAt: null,
   };
+}
+
+function emptyDeceptionHistory() {
+  return {
+    hasEvidence: false,
+    evidenceScore: 0,
+    totalEvents: 0,
+    distinctSignals: [],
+    distinctScoredSignals: [],
+    signalCounts: {},
+    strongestEvidenceLevel: null,
+    firstEventAt: null,
+    lastEventAt: null,
+    recentEvents: [],
+  };
+}
+
+const EVIDENCE_LEVEL_ORDER = Object.freeze({
+  observation: 0,
+  supporting: 1,
+  medium: 2,
+  strong: 3,
+});
+const MAX_DECEPTION_EVENTS_PER_ENTITY = 100;
+
+function recordDeceptionHistory(entity, events, timestamp) {
+  if (!entity || !Array.isArray(events) || !events.length) return false;
+  const history = entity.deceptionHistory || (entity.deceptionHistory = emptyDeceptionHistory());
+  for (const source of events) {
+    const metadata = DECEPTION_SIGNAL_CATALOG[source?.signal];
+    if (!metadata) continue;
+    const occurredAt = Number.isFinite(source.occurredAt) ? source.occurredAt : timestamp;
+    const event = {
+      eventId: String(source.eventId || crypto.randomUUID()),
+      signal: source.signal,
+      evidenceLevel: metadata.evidenceLevel,
+      scored: metadata.scored,
+      originSessionId: source.originSessionId ? String(source.originSessionId) : null,
+      occurredAt,
+      detail: String(source.detail || "").slice(0, 500),
+    };
+    history.hasEvidence = true;
+    history.totalEvents += 1;
+    history.signalCounts[event.signal] = (history.signalCounts[event.signal] || 0) + 1;
+    addUnique(history.distinctSignals, [event.signal]);
+    if (metadata.scored) addUnique(history.distinctScoredSignals, [event.signal]);
+    if (
+      history.strongestEvidenceLevel === null ||
+      EVIDENCE_LEVEL_ORDER[event.evidenceLevel] >
+        EVIDENCE_LEVEL_ORDER[history.strongestEvidenceLevel]
+    ) {
+      history.strongestEvidenceLevel = event.evidenceLevel;
+    }
+    if (history.firstEventAt === null || occurredAt < history.firstEventAt) {
+      history.firstEventAt = occurredAt;
+    }
+    if (history.lastEventAt === null || occurredAt > history.lastEventAt) {
+      history.lastEventAt = occurredAt;
+    }
+    history.recentEvents.push(event);
+    if (history.recentEvents.length > MAX_DECEPTION_EVENTS_PER_ENTITY) {
+      history.recentEvents.shift();
+    }
+  }
+  history.evidenceScore = Number(
+    (history.distinctScoredSignals.length / SCORED_DECEPTION_SIGNALS.length).toFixed(3)
+  );
+  return true;
 }
 
 function addUnique(target, values) {
@@ -108,6 +177,7 @@ function getOrCreateSession(sessionId, ip) {
       actorIds: new Set(),
       userAgent: null,
       attackHistory: emptyAttackHistory(),
+      deceptionHistory: emptyDeceptionHistory(),
       telemetry: {
         mouseMoveCount: 0,
         scrollCount: 0,
@@ -157,6 +227,7 @@ function recordRequest(
     responseContentLength = null,
     responseBodyBytes = null,
     attackDetection = null,
+    deceptionEvents = [],
     ts,
   }
 ) {
@@ -200,6 +271,17 @@ function recordRequest(
     responseContentLength,
     responseBodyBytes,
     attackDetection,
+    deceptionEvents: Array.isArray(deceptionEvents)
+      ? deceptionEvents.map((event) => ({
+          eventId: event.eventId,
+          signal: event.signal,
+          evidenceLevel: event.evidenceLevel,
+          scored: event.scored,
+          originSessionId: event.originSessionId || null,
+          occurredAt: event.occurredAt,
+          detail: String(event.detail || "").slice(0, 500),
+        }))
+      : [],
     body: truncateBody(body),
     tags: tags || [],
   };
@@ -219,6 +301,7 @@ function recordRequest(
         actorIds: new Set(),
         requests: [],
         attackHistory: emptyAttackHistory(),
+        deceptionHistory: emptyDeceptionHistory(),
       });
     }
     const authGroup = authGroups.get(authGroupId);
@@ -247,6 +330,7 @@ function recordRequest(
       sessionIds: new Set(),
       requests: [],
       attackHistory: emptyAttackHistory(),
+      deceptionHistory: emptyDeceptionHistory(),
     });
   }
   const actor = actors.get(actorId);
@@ -282,6 +366,10 @@ function recordRequest(
   recordCrsAttackHistory(s, attackDetection, now);
   recordCrsAttackHistory(actor, attackDetection, now);
   if (authGroupId) recordCrsAttackHistory(authGroups.get(authGroupId), attackDetection, now);
+  // 동일 신호가 반복돼도 evidenceScore에는 고유 신호 1회만 반영하고 실제 횟수는 보존한다.
+  recordDeceptionHistory(s, deceptionEvents, now);
+  recordDeceptionHistory(actor, deceptionEvents, now);
+  if (authGroupId) recordDeceptionHistory(authGroups.get(authGroupId), deceptionEvents, now);
 
   return s;
 }
@@ -351,6 +439,8 @@ module.exports = {
   getIpEntry,
   updateAttackScoreHistory,
   emptyAttackHistory,
+  emptyDeceptionHistory,
+  recordDeceptionHistory,
   headerFingerprint,
   deriveActorId,
   withoutSensitiveHeaders,

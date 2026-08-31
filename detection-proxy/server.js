@@ -29,6 +29,7 @@ const {
   computePartitionedAgenticEvidence,
 } = require("./lib/agenticEvidence");
 const { CrsScanner } = require("./lib/crsScanner");
+const { DeceptionEngine } = require("./lib/deceptionEngine");
 
 const PORT = process.env.PORT || 8080;
 const TARGET = process.env.TARGET_URL || process.env.JUICE_SHOP_URL || "http://localhost:3000";
@@ -41,6 +42,7 @@ const PAYLOAD_FINGERPRINT_KEY = configuredPayloadFingerprintKey || crypto.random
 
 const SESSION_COOKIE = "dlsid";
 const crsScanner = new CrsScanner();
+const deceptionEngine = new DeceptionEngine();
 
 const app = express();
 app.disable("x-powered-by");
@@ -80,6 +82,89 @@ function analyzeAuthGroup(group) {
   };
 }
 
+function prepareRequestObservation(req) {
+  if (req._detectionPrepared) return;
+  req._detectionPrepared = true;
+  req._detectionStart = Date.now();
+  req.experimentRunId = ENABLE_EXPERIMENT_RUN_ID
+    ? sanitizeExperimentRunId(req.headers[EXPERIMENT_RUN_HEADER])
+    : null;
+  req.authGroupId = deriveAuthGroupId(req.headers.authorization);
+  req.hasAuthorization = typeof req.headers.authorization === "string";
+  req.detectionHeaders = store.withoutSensitiveHeaders(req.headers);
+  req.payloadFingerprint = createPayloadFingerprint(
+    req.body,
+    req.headers["content-type"] || "",
+    PAYLOAD_FINGERPRINT_KEY
+  );
+  req.deceptionEvents = deceptionEngine.inspectRequest({
+    sessionId: req.detectionSessionId,
+    method: req.method,
+    url: req.originalUrl,
+    rawBody: req.detectionRequestBodyBuffer,
+    body: req.body,
+  });
+}
+
+function recordCompletedRequest(req, {
+  status,
+  responseContentType = null,
+  responseContentLength = null,
+  responseBodyBytes = null,
+  attackDetection,
+}) {
+  const ip = getClientIp(req);
+  const detection = attackDetection || {
+    available: false,
+    error: "scan was not started",
+    categories: [],
+    hits: [],
+  };
+  const tags = detection.available ? detection.categories : tagPayload(req.originalUrl, req.body);
+  const session = store.recordRequest(req.detectionSessionId, ip, {
+    method: req.method,
+    url: req.originalUrl,
+    status,
+    headers: req.detectionHeaders,
+    body: deceptionEngine.redactBodyForLog(req.body),
+    tags,
+    authGroupId: req.authGroupId,
+    payloadFingerprint: req.payloadFingerprint,
+    hasAuthorization: req.hasAuthorization,
+    experimentRunId: req.experimentRunId,
+    requestContentType: sanitizeMetadataHeaderValue(req.headers["content-type"]),
+    requestContentLength: parseContentLength(req.headers["content-length"]),
+    requestBodyBytes: Number.isSafeInteger(req.detectionRequestBodyBytes)
+      ? req.detectionRequestBodyBytes
+      : null,
+    responseContentType: sanitizeMetadataHeaderValue(responseContentType),
+    responseContentLength: Number.isSafeInteger(responseContentLength)
+      ? responseContentLength
+      : parseContentLength(responseContentLength),
+    responseBodyBytes,
+    attackDetection: detection,
+    deceptionEvents: req.deceptionEvents,
+  });
+
+  const sessionAnalysis = analyzeSession(session);
+  const actorId = session.requests.at(-1)?.actorId;
+  const actor = actorId ? store.getActor(actorId) : null;
+  const actorAnalysis = actor ? analyzeActor(actor) : sessionAnalysis;
+  const authGroup = req.authGroupId ? store.getAuthGroup(req.authGroupId) : null;
+  const authGroupAnalysis = authGroup ? analyzeAuthGroup(authGroup) : null;
+  store.updateAttackScoreHistory({
+    sessionId: session.id,
+    actorId,
+    authGroupId: req.authGroupId,
+    scores: {
+      session: sessionAnalysis.attackScore,
+      actor: actorAnalysis.attackScore,
+      authGroup: authGroupAnalysis?.attackScore,
+    },
+  });
+  return { session, sessionAnalysis, actorAnalysis, authGroupAnalysis };
+}
+
 // 세션 쿠키 부여 (없으면 새로 발급)
 app.use((req, res, next) => {
   let sid = req.cookies[SESSION_COOKIE];
@@ -108,6 +193,31 @@ function captureParsedBodyBytes(req, _res, buffer) {
 app.use(express.json({ limit: "5mb", verify: captureParsedBodyBytes }));
 app.use(express.urlencoded({ extended: true, limit: "5mb", verify: captureParsedBodyBytes }));
 
+// 팀원 Python 프록시의 미끼 라우트를 현재 Express 프록시 안에서 직접 처리한다.
+// 이 요청도 일반 요청과 동일하게 CRS, Session, Actor, Auth Group과 타임라인에 기록한다.
+app.use((req, res, next) => {
+  const trap = deceptionEngine.matchTrap({
+    sessionId: req.detectionSessionId,
+    method: req.method,
+    url: req.originalUrl,
+  });
+  if (!trap) return next();
+
+  prepareRequestObservation(req);
+  req.deceptionEvents.push(...trap.events);
+  const responseBuffer = Buffer.from(trap.body, "utf8");
+  crsScanner.scan(req, getClientIp(req)).then((attackDetection) => {
+    recordCompletedRequest(req, {
+      status: trap.status,
+      responseContentType: trap.contentType,
+      responseContentLength: responseBuffer.length,
+      responseBodyBytes: responseBuffer.length,
+      attackDetection,
+    });
+    res.status(trap.status).type(trap.contentType).send(responseBuffer);
+  }).catch(next);
+});
+
 app.post("/__detection/telemetry", (req, res) => {
   const ip = getClientIp(req);
   store.recordTelemetry(req.detectionSessionId, ip, req.body || {});
@@ -122,6 +232,7 @@ app.get("/__detection/api/sessions", (req, res) => {
       ip: s.ip,
       ...analyzeSession(s),
       attackHistory: s.attackHistory,
+      deceptionHistory: s.deceptionHistory,
       firstSeen: s.firstSeen,
       lastSeen: s.lastSeen,
     };
@@ -139,6 +250,7 @@ app.get("/__detection/api/sessions/:id", (req, res) => {
     ip: s.ip,
     ...analyzeSession(s),
     attackHistory: s.attackHistory,
+    deceptionHistory: s.deceptionHistory,
     firstSeen: s.firstSeen,
     lastSeen: s.lastSeen,
     requests: s.requests,
@@ -165,6 +277,7 @@ app.get("/__detection/api/actors", (req, res) => {
       fingerprint: actor.fingerprint,
       ...analyzeActor(actor),
       attackHistory: actor.attackHistory,
+      deceptionHistory: actor.deceptionHistory,
       totalRequests: actor.totalRequests,
       sessionCount: actor.sessionIds.size,
       firstSeen: actor.firstSeen,
@@ -183,6 +296,7 @@ app.get("/__detection/api/actors/:id", (req, res) => {
     fingerprint: actor.fingerprint,
     ...analyzeActor(actor),
     attackHistory: actor.attackHistory,
+    deceptionHistory: actor.deceptionHistory,
     firstSeen: actor.firstSeen,
     lastSeen: actor.lastSeen,
     totalRequests: actor.totalRequests,
@@ -211,6 +325,7 @@ app.get("/__detection/api/auth-groups", (req, res) => {
       authGroupId: group.id,
       ...analyzeAuthGroup(group),
       attackHistory: group.attackHistory,
+      deceptionHistory: group.deceptionHistory,
       totalRequests: group.totalRequests,
       sessionCount: group.sessionIds.size,
       actorCount: group.actorIds.size,
@@ -228,6 +343,7 @@ app.get("/__detection/api/auth-groups/:id", (req, res) => {
     authGroupId: group.id,
     ...analyzeAuthGroup(group),
     attackHistory: group.attackHistory,
+    deceptionHistory: group.deceptionHistory,
     firstSeen: group.firstSeen,
     lastSeen: group.lastSeen,
     totalRequests: group.totalRequests,
@@ -279,6 +395,10 @@ app.get("/__detection/api/crs-status", (req, res) => {
   });
 });
 
+app.get("/__detection/api/deception-status", (req, res) => {
+  res.json(deceptionEngine.status());
+});
+
 // Auth Group의 공격 경로 = 동일 Bearer token을 쓴 모든 세션의 시간순 요청 타임라인
 app.get("/__detection/api/auth-groups/:id/path", (req, res) => {
   const group = store.getAuthGroup(req.params.id);
@@ -303,6 +423,7 @@ app.get("/__detection/api/export", (req, res) => {
       lastSeen: s.lastSeen,
       analysis: analyzeSession(s),
       attackHistory: s.attackHistory,
+      deceptionHistory: s.deceptionHistory,
       requests: s.requests,
     };
   });
@@ -324,22 +445,9 @@ app.use(
     changeOrigin: true,
     selfHandleResponse: true,
     onProxyReq: (proxyReq, req) => {
-      req._detectionStart = Date.now();
-      const rawExperimentRunId = req.headers[EXPERIMENT_RUN_HEADER];
-      req.experimentRunId = ENABLE_EXPERIMENT_RUN_ID
-        ? sanitizeExperimentRunId(rawExperimentRunId)
-        : null;
+      prepareRequestObservation(req);
       // Ground truth용 헤더는 탐지 프록시에서 소비하고 Juice Shop target에는 전달하지 않는다.
       proxyReq.removeHeader(EXPERIMENT_RUN_HEADER);
-      // raw Bearer token은 이 시점에만 읽고, 이후에는 단방향 hash ID만 전달한다.
-      req.authGroupId = deriveAuthGroupId(req.headers.authorization);
-      req.hasAuthorization = typeof req.headers.authorization === "string";
-      req.detectionHeaders = store.withoutSensitiveHeaders(req.headers);
-      req.payloadFingerprint = createPayloadFingerprint(
-        req.body,
-        req.headers["content-type"] || "",
-        PAYLOAD_FINGERPRINT_KEY
-      );
       // ModSecurity/CRS 검사는 응답을 차단하지 않으며 결과만 비동기로 기록한다.
       req.crsScanPromise = crsScanner.scan(req, getClientIp(req));
       // express.json()/urlencoded()가 body를 이미 읽어버렸다면 juice-shop으로 다시 실어준다.
@@ -347,52 +455,15 @@ app.use(
       fixRequestBody(proxyReq, req);
     },
     onProxyRes: responseInterceptor(async (responseBuffer, proxyRes, req, res) => {
-      const ip = getClientIp(req);
       const attackDetection = req.crsScanPromise
         ? await req.crsScanPromise
         : { available: false, error: "scan was not started", categories: [], hits: [] };
-      // 컨테이너 밖에서 단위 테스트를 실행하는 경우처럼 CRS 엔진을 사용할 수 없을 때만
-      // 기존 정규식을 fallback으로 유지한다. CRS 이력에는 이 fallback 결과를 섞지 않는다.
-      const tags = attackDetection.available
-        ? attackDetection.categories
-        : tagPayload(req.originalUrl, req.body);
-      const session = store.recordRequest(req.detectionSessionId, ip, {
-        method: req.method,
-        url: req.originalUrl,
+      const { session, sessionAnalysis, actorAnalysis } = recordCompletedRequest(req, {
         status: proxyRes.statusCode,
-        headers: req.detectionHeaders,
-        body: req.body,
-        tags,
-        authGroupId: req.authGroupId,
-        payloadFingerprint: req.payloadFingerprint,
-        hasAuthorization: req.hasAuthorization,
-        experimentRunId: req.experimentRunId,
-        requestContentType: sanitizeMetadataHeaderValue(req.headers["content-type"]),
-        requestContentLength: parseContentLength(req.headers["content-length"]),
-        requestBodyBytes: Number.isSafeInteger(req.detectionRequestBodyBytes)
-          ? req.detectionRequestBodyBytes
-          : null,
-        responseContentType: sanitizeMetadataHeaderValue(proxyRes.headers["content-type"]),
-        responseContentLength: parseContentLength(proxyRes.headers["content-length"]),
+        responseContentType: proxyRes.headers["content-type"],
+        responseContentLength: proxyRes.headers["content-length"],
         responseBodyBytes: responseBuffer.length,
         attackDetection,
-      });
-
-      const sessionAnalysis = analyzeSession(session);
-      const actorId = session.requests.at(-1)?.actorId;
-      const actor = actorId ? store.getActor(actorId) : null;
-      const actorAnalysis = actor ? analyzeActor(actor) : sessionAnalysis;
-      const authGroup = req.authGroupId ? store.getAuthGroup(req.authGroupId) : null;
-      const authGroupAnalysis = authGroup ? analyzeAuthGroup(authGroup) : null;
-      store.updateAttackScoreHistory({
-        sessionId: session.id,
-        actorId,
-        authGroupId: req.authGroupId,
-        scores: {
-          session: sessionAnalysis.attackScore,
-          actor: actorAnalysis.attackScore,
-          authGroup: authGroupAnalysis?.attackScore,
-        },
       });
 
       // 실험 검증 전에는 BLOCK_MODE도 log-only다. 응답 상태나 body를 변경하지 않는다.
@@ -414,13 +485,16 @@ app.use(
       // HTML 응답이면 telemetry.js 를 </body> 직전에 주입
       const contentType = proxyRes.headers["content-type"] || "";
       if (contentType.includes("text/html")) {
-        const html = responseBuffer.toString("utf8");
-        const injected = html.includes("</body>")
-          ? html.replace(
+        const htmlWithDeception = deceptionEngine.injectSignals(
+          responseBuffer.toString("utf8"),
+          session.id
+        );
+        const injected = htmlWithDeception.includes("</body>")
+          ? htmlWithDeception.replace(
               "</body>",
               '<script src="/__detection/static/telemetry.js"></script></body>'
             )
-          : html + '<script src="/__detection/static/telemetry.js"></script>';
+          : htmlWithDeception + '<script src="/__detection/static/telemetry.js"></script>';
         return injected;
       }
 
@@ -437,6 +511,7 @@ app.listen(PORT, () => {
   );
   console.log(`[detection-proxy] experiment run header enabled=${ENABLE_EXPERIMENT_RUN_ID}`);
   console.log(`[detection-proxy] CRS status=${JSON.stringify(crsScanner.status())}`);
+  console.log(`[detection-proxy] Deception status=${JSON.stringify(deceptionEngine.status())}`);
   if (!configuredPayloadFingerprintKey) {
     console.warn(
       "[detection-proxy] PAYLOAD_FINGERPRINT_KEY is unset; using an ephemeral key (fingerprints change after restart)"

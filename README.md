@@ -9,6 +9,7 @@ OWASP Juice Shop을 기본 대상으로 실행하지만 `TARGET_URL`을 바꾸�
 Browser / AI Agent ──▶ detection-proxy (:8080) ──▶ juice-shop (:3000)
                               │
                               ├─ ModSecurity 3.0.16 + OWASP CRS 4.25.1 (탐지 전용)
+                              ├─ 팀원 Honey/Deception 탐지 (동일 Node 프로세스)
                               ├─ Session 로그 (세션 쿠키 dlsid 기준)
                               ├─ Client Actor 집계 (IP + 헤더 fingerprint 기준)
                               ├─ Auth Group 집계 (동일 Bearer token hash 기준)
@@ -31,8 +32,10 @@ docker compose up --build
 - Auth Group API: http://localhost:8080/__detection/api/auth-groups
 - IP Entry API: http://localhost:8080/__detection/api/ip-entries
 - CRS 상태 API: http://localhost:8080/__detection/api/crs-status
+- Deception 상태 API: http://localhost:8080/__detection/api/deception-status
 
-외부에 노출되는 프록시는 Node의 `detection-proxy` 하나뿐입니다. ModSecurity는 같은
+외부에 노출되고 요청을 중계하는 프록시는 Node의 `detection-proxy` 하나뿐입니다. Honey/Deception
+로직도 이 프로세스의 Express 라우트와 응답 interceptor에서 직접 실행됩니다. ModSecurity는 같은
 컨테이너 안에서 지속 실행되는 규칙 평가 helper이며 별도 포트를 열거나 요청을 전달하지
 않습니다. `SecRuleEngine DetectionOnly`로 동작하므로 CRS 탐지 결과가 원래 응답을 차단하거나
 변경하지 않습니다.
@@ -46,6 +49,7 @@ docker compose up --build
 | Exploration | 최근 50개 요청의 404 비율과 401/403 비율 | Attack |
 | Client | Session churn, Header anomaly, 통합 Browser interaction | Automation |
 | Attack | 최근 50개 요청의 OWASP CRS 규칙 탐지 결과와 SQLi/XSS/Traversal 등 공격 유형 | Attack |
+| Deception | 워터마크·미끼 자격증명 재사용, 트랩·미끼 파일·스크립트 접근 | 별도 Deception Evidence |
 
 Automation Score는 Timing 20%, Intensity 20%, Repeated Operation 15%, Session Churn 10%,
 Header Anomaly 15%, Browser Interaction 20%로 구성됩니다. Attack Score는 Payload Signature
@@ -54,6 +58,12 @@ Header Anomaly 15%, Browser Interaction 20%로 구성됩니다. Attack Score는 
 
 각 점수는 0~1 내부값을 Dashboard에서 0~100 Score로 표시하는 실험 전 휴리스틱이며 확률이 아닙니다.
 Agentic Evidence도 원시 count로만 제공하며 별도 점수, 가중치, AI Agent 라벨을 생성하지 않습니다.
+
+Deception Evidence도 AI 여부나 공격 확률이 아닙니다. 팀원이 제공한 미끼 콘텐츠에 반응한 행위의
+종류를 나타내며, 같은 신호가 반복돼도 정규화 값에는 고유 신호 1회만 반영합니다. 반복 횟수는
+`signalCounts`와 `totalEvents`에 별도로 보존합니다. `coverage`와 `no_asset_loading`은 기존 경로
+다양성·브라우저 상호작용 Feature와 일부 겹치고 정상 API 클라이언트 오탐 가능성이 있어 정규화
+대상에서 제외한 관찰값입니다.
 
 브라우저 텔레메트리는 문서와 내부 요소의 스크롤을 capture 단계에서 수집합니다. SPA 화면 이동은
 `history.pushState`, `history.replaceState`, `popstate`, `hashchange`를 관찰하며, 현재 URL에는
@@ -122,6 +132,35 @@ CRS는 JSON과 URL-encoded 원문 본문을 최대 1 MiB까지 검사하며 URI�
 이번 연동은 기존 `AUTOMATION_WEIGHTS`, `ATTACK_WEIGHTS`, 정규화 수치와 차단 동작을 변경하지
 않았습니다. CRS는 기존 payload signature의 입력 출처를 범용 규칙으로 확장하고, 누적 이력은
 현재 점수와 별도 관찰값으로 제공합니다.
+
+## 통합 Honey/Deception 탐지
+
+팀원 저장소 `detection/proxy/detect_proxy/Detect_proxy.py`의 커밋 `4e0e791`에서 검증한 신호
+조건과 미끼 문구를 현재 Node 프록시의 `lib/deceptionEngine.js`로 이식했습니다. Python FastAPI,
+별도 프록시, `connect.sid`, SQLite 점수 저장소는 실행하지 않습니다.
+
+- `watermark_reuse`: 세션별 ZWJ 워터마크가 이후 요청 본문에서 재사용됨
+- `ssh_cred_reuse`, `password_list_reuse`: HTML에 제공한 미끼 자격증명이 재사용됨
+- `trap_trigger`: 세션별 토큰이 포함된 off-screen 링크에 접근함
+- `writable_file_found`, `writable_file_write`: 미끼 설정 파일 조회·쓰기 시도
+- `script_hint_access`: HTML에 언급된 미끼 유지보수 스크립트 접근
+- `coverage`, `no_asset_loading`: 관찰 전용이며 Deception Evidence 정규화에서 제외
+
+세션별 워터마크는 전역 토큰 registry에 발급 세션을 보존하므로 curl이 `dlsid`를 재사용하지 않아도
+본문에 워터마크가 있으면 원래 발급 세션을 `originSessionId`로 연결할 수 있습니다. registry와
+Deception 이력은 현재 인메모리이므로 프로세스 재시작 후에는 초기화됩니다. 원문 워터마크는
+이벤트 detail과 요청 body 로그에서 `[DECEPTION_WATERMARK_REDACTED]`로 대체합니다.
+
+Deception Evidence는 점수 대상 7개 신호 중 관찰된 고유 신호 비율입니다. 예를 들어 같은
+`trap_trigger`가 4번 발생해도 `totalEvents`는 4 증가하지만 정규화 값에는 1개 신호만 반영됩니다.
+이 값은 Automation Score·Attack Score와 합산하지 않으며 차단에도 사용하지 않습니다.
+
+```yaml
+environment:
+  - DECEPTION_ENABLED=true
+  - DECEPTION_TOKEN_TTL_MS=3600000
+  - DECEPTION_MAX_SESSIONS=5000
+```
 
 ## Authorization Auth Group
 

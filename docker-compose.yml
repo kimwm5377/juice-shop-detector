@@ -22,6 +22,10 @@ services:
       - CRS_ENABLED=true
       - CRS_SCAN_TIMEOUT_MS=2000
       - CRS_MAX_BODY_BYTES=1048576
+      # 팀원 Honey/Deception 신호를 동일 Node 프록시 안에서 관찰 전용으로 실행합니다.
+      - DECEPTION_ENABLED=true
+      - DECEPTION_TOKEN_TTL_MS=3600000
+      - DECEPTION_MAX_SESSIONS=5000
       - ENABLE_EXPERIMENT_RUN_ID=true
       - PAYLOAD_FINGERPRINT_KEY=${PAYLOAD_FINGERPRINT_KEY:-}
     depends_on:
