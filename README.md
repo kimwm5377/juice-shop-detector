@@ -13,6 +13,7 @@ Browser / AI Agent ──▶ detection-proxy (:8080) ──▶ juice-shop (:3000
                               ├─ Session 로그 (세션 쿠키 dlsid 기준)
                               ├─ Client Actor 집계 (IP + 헤더 fingerprint 기준)
                               ├─ Auth Group 집계 (동일 Bearer token hash 기준)
+                              ├─ Resolved Actor 집계 (signed dcid 기반 Session Membership)
                               ├─ IP Entry 관찰 (동일 IP 전체, 점수/차단 제외)
                               ├─ HTML 응답에 telemetry.js 자동 주입
                               ├─ POST /__detection/telemetry 로 마우스/스크롤/DOM/SPA 이동 수집
@@ -30,6 +31,7 @@ docker compose up --build
 - 세션 API: http://localhost:8080/__detection/api/sessions
 - Client Actor API: http://localhost:8080/__detection/api/actors
 - Auth Group API: http://localhost:8080/__detection/api/auth-groups
+- Resolved Actor API: http://localhost:8080/__detection/api/resolved-actors
 - IP Entry API: http://localhost:8080/__detection/api/ip-entries
 - CRS 상태 API: http://localhost:8080/__detection/api/crs-status
 - Deception 상태 API: http://localhost:8080/__detection/api/deception-status
@@ -48,16 +50,49 @@ docker compose up --build
 | Behavior | 최근 10개 operation, 최근 20개 반복률/최대 연속 반복, 최근 50개 경로 다양성 | 반복만 Automation, 나머지 관찰 |
 | Exploration | 최근 50개 요청의 404 비율과 401/403 비율 | Attack |
 | Client | Session churn, Header anomaly, 통합 Browser interaction | Automation |
-| Attack | 최근 50개 요청의 OWASP CRS 규칙 탐지 결과와 SQLi/XSS/Traversal 등 공격 유형 | Attack |
-| Honey/Deception | 자동화형 트랩·coverage와 공격형 워터마크·미끼 자격증명·파일 반응 | Automation/Attack에 각각 최대 35% |
+| Attack | 저장된 lifecycle 전체의 CRS/공격 유형, IDOR 순회, 로그인·재설정 남용, 비즈니스 로직 위반, CSRF 헤더 위반 | Attack |
+| Honey/Deception | 자동화형 트랩·coverage와 공격형 워터마크·미끼 자격증명·파일 반응 | Automation 최대 35%, Attack 최대 22% |
 
 Automation Score는 Timing 5%, Intensity 5%, Repeated Operation 10%, Session Churn 10%,
 Header Anomaly 15%, Browser Interaction 20%, Automation Honey 35%로 구성됩니다. Attack Score는
-Payload Signature 55%, 404 Exploration 5%, 401/403 Exploration 5%, Attack Honey 35%로
+Payload Signature 30%, 404 Exploration 6%, 401/403 Exploration 6%, IDOR Walk 7%,
+Login/Password Reset Abuse 8%, Business Logic Violation 12%, CSRF 9%, Attack Honey 22%로
 구성됩니다. Sequence는 점수화하지 않습니다.
 
 각 점수는 0~1 내부값을 Dashboard에서 0~100 Score로 표시하는 실험 전 휴리스틱이며 확률이 아닙니다.
 Agentic Evidence도 원시 count로만 제공하며 별도 점수, 가중치, AI Agent 라벨을 생성하지 않습니다.
+
+### 탐지 판정 기준
+
+LOW/MEDIUM/HIGH는 점수에 붙이는 위험도 등급이 아니라 AI 접근과 공격을 식별할 최소
+점수 기준입니다. LOW는 30점, MEDIUM은 50점, HIGH는 70점이며 Automation과 Attack에
+같은 기준을 적용합니다.
+
+| `DETECTION_LEVEL` | 판정 임계값 |
+|---|---:|
+| `low` | 30점 |
+| `medium` (기본) | 50점 |
+| `high` | 70점 |
+
+AI 접근 판정은 최근 요청 행동을 반영하는 현재 Automation Score를 사용합니다. 공격 판정은
+정상 요청이 이어진 뒤에도 이미 관찰된 공격 흔적을 잃지 않도록 현재값과
+`attackHistory.maxAttackScore` 중 큰 값, 즉 과거 최고 Attack Score를 사용합니다. 대시보드에서
+판정 기준을 바꾸면 각 흐름의 `AI 접근 식별`과 `공격 식별` 표시를 즉시 다시 계산합니다.
+
+### Socket.IO 백그라운드 요청 처리
+
+Juice Shop이 자동으로 보내는 `/socket.io/` 요청은 원본 요청 로그와 Session/Actor 연결에는 그대로
+보존합니다. 다만 사용자가 직접 선택한 동작이 아니므로 Timing, Intensity, Repeated Operation,
+Sequence, 경로 다양성, 404/401/403 탐색 및 Browser Interaction의 요청 수 조건에서는 제외합니다.
+URI·헤더·본문에 대한 CRS 및 공격 태그 검사는 제외하지 않으므로 백그라운드 요청에 공격 신호가
+실린 경우에는 Attack 관찰과 누적 공격 이력에 남습니다.
+
+각 Feature 응답의 `requestAccounting`에서 `totalRequests`, `behaviorAnalyzedRequests`,
+`backgroundRequests`, `backgroundByCategory`를 구분해 확인할 수 있습니다. Socket.IO query의
+`sid`는 사용자나 Actor 식별자가 아니라 연결 관찰값이며, 별도 `connectionId` 필드에는 SHA-256
+해시의 앞 16자리만 저장합니다. Actor 연속성은 기존처럼 검증된 `dcid`와 Session Membership을
+사용합니다. 대시보드 타임라인은 신호 없는 연속 백그라운드 요청을 기본으로 묶고 필요할 때
+펼쳐 볼 수 있으며, 공격 태그·CRS·오류가 있는 요청은 접지 않습니다.
 
 Honey 신호도 AI 여부나 공격 확률의 증명이 아닙니다. 팀원이 제공한 미끼 콘텐츠에 반응한 행위를
 Automation 또는 Attack의 보조 근거로 반영합니다. 같은 신호가 반복돼도 점수에는 고유 신호 1회만
@@ -91,7 +126,7 @@ curl http://localhost:8080/__detection/api/export -o detection-log-export.json
 `body`는 최대 2000자로 잘려 저장됩니다(메모리 보호). 정상 컨테이너 환경에서는 OWASP CRS가
 URI·헤더·지원되는 요청 본문을 검사해 `attackDetection`, rule ID, anomaly score와 공격 유형을
 기록합니다. CRS가 비활성화되거나 실행되지 못한 경우에만 기존 `lib/payloadSignatures.js`의
-정규식을 최근 Attack Score용 fallback으로 사용하며, fallback 결과는 CRS 누적 이력에 넣지 않습니다.
+정규식을 Attack Score용 fallback으로 사용하며, fallback 결과는 CRS 누적 이력에 넣지 않습니다.
 Authorization, Proxy-Authorization, Cookie와 실험 식별자 원문은 CRS helper로 전달하지 않습니다.
 
 `normalizedPath`는 query를 제거하고 숫자 경로 segment를 `:id`, UUID를 `:uuid`로 바꿉니다.
@@ -107,8 +142,8 @@ multipart·바이너리 요청은 `null`일 수 있습니다. `responseBodyBytes
 
 ## OWASP CRS와 누적 공격 이력
 
-최근 Attack Score는 기존처럼 최근 50개 요청을 사용하므로 정상 요청이 이어지면 낮아질 수 있습니다.
-이와 별도로 Session, Actor Candidate, Auth Group에는 `attackHistory`를 유지합니다.
+Attack Score의 공격 증거는 최근 50개 요청에 한정하지 않고 저장된 Session, Actor Candidate,
+Auth Group lifecycle 전체에서 집계합니다. 이와 별도로 각 집계 단위에는 `attackHistory`를 유지합니다.
 
 - `hasAttackHistory`: CRS 공격 규칙이 한 번이라도 탐지됐는지
 - `maxAttackScore`: 해당 집계 단위에서 관찰된 과거 최고 Attack Score
@@ -117,9 +152,10 @@ multipart·바이너리 요청은 `null`일 수 있습니다. `responseBodyBytes
 - `matchedRuleIds`, `attackCategories`: 지금까지 탐지된 규칙과 공격 유형
 - `firstAttackAt`, `lastAttackAt`: 최초·최근 CRS 공격 탐지 시각
 
-따라서 공격 요청이 최근 50개 윈도우 밖으로 밀려나도 누적 이력은 유지됩니다. 다만 저장소가
-현재 인메모리이므로 “누적” 범위는 프록시 프로세스가 실행 중인 동안이며 재시작 후 영구 보존이
-필요하면 Redis나 데이터베이스 저장을 추가해야 합니다. 대시보드 목록의 `Attack History`와
+세션별 요청 ring buffer는 메모리 보호를 위해 최대 500건이지만, 매 요청 시 갱신되는
+`maxAttackScore`가 이미 계산된 최고 공격 점수를 유지합니다. 저장소가 현재 인메모리이므로
+이 범위는 프록시 프로세스가 실행 중인 동안이며 재시작 후 영구 보존이 필요하면 Redis나
+데이터베이스 저장을 추가해야 합니다. 대시보드 목록의 `Attack History`와
 각 상세 화면에서 현재 점수와 누적 이력을 분리해 확인할 수 있습니다.
 
 CRS는 `application/json`, `application/*+json`, URL-encoded 원문 본문을 최대 1 MiB까지 검사하며 URI와 비민감 헤더는 요청 형식과
@@ -128,8 +164,40 @@ CRS는 `application/json`, `application/*+json`, URL-encoded 원문 본문을 �
 `CRS_SCAN_TIMEOUT_MS`로 상한을 조정할 수 있습니다.
 
 CRS는 기존 payload signature의 입력 출처를 범용 규칙으로 확장하고, 누적 이력은 현재 점수와
-별도 관찰값으로 제공합니다. Honey 통합에 따라 `AUTOMATION_WEIGHTS`와 `ATTACK_WEIGHTS`는 각각
-기존 Feature 65%, Honey 35% 구조로 조정했습니다.
+별도 관찰값으로 제공합니다. Automation은 기존 Feature 65%와 Honey 35%, Attack은 일반 공격
+Feature 78%와 Honey 22%로 구성됩니다.
+
+## 비즈니스 로직 탐지와 스키마 학습
+
+다음 신호는 CRS의 문법 기반 탐지와 별도로 요청 의미와 반복 패턴을 관찰합니다.
+
+- `idorWalk`: 동일 자원 유형의 서로 다른 숫자 ID 순회
+- `loginBruteForce`: 401 로그인 실패, 비밀번호 재설정, 보안 질문 조회의 이메일별 반복
+- `businessLogicViolation`: mass assignment, 숫자 범위 남용, NoSQL 연산자, comment-only SQLi,
+  JWT claimed identity와 대상 ID 불일치, 관리자 경로 무단 접근, 총액 불일치와 가격 급락
+- `csrf`: 상태 변경 요청의 Origin/Referer 누락 또는 허용 origin 불일치
+
+`CSRF_ALLOWED_ORIGINS`는 쉼표로 구분하며 기본값은
+`http://localhost:8080,http://127.0.0.1:8080`입니다. Origin/Referer가 없는 직접 HTTP 요청도
+신호가 되므로, 이 값은 공격 확정이 아니라 다른 증거와 합산하는 휴리스틱입니다.
+
+`schemaLearning`은 성공한 상태 변경 요청의 필드와 role별 성공/거부, URL 끝 숫자 ID와 JWT
+claim의 일치율을 관찰합니다. 학습 결과는 자동 적용하지 않고 아래 API에서 사람이 승인한 뒤에만
+mass-assignment, role-gated, identity fallback 규칙으로 사용합니다.
+
+```text
+GET  /__detection/api/schema-learning/candidates
+POST /__detection/api/schema-learning/mass-assignment/approve
+POST /__detection/api/schema-learning/mass-assignment/reject
+POST /__detection/api/schema-learning/role-gated/approve
+POST /__detection/api/schema-learning/role-gated/reject
+POST /__detection/api/schema-learning/identity/approve
+POST /__detection/api/schema-learning/identity/reject
+POST /__detection/api/schema-learning/reset
+```
+
+학습 상태는 `detection-proxy/data/schema-learning.json`에 저장되며 Docker bind mount로
+재생성 후에도 유지됩니다. 이 파일은 실행 데이터이므로 Git에는 포함하지 않습니다.
 
 ## 통합 Honey/Deception 탐지
 
@@ -181,6 +249,57 @@ curl http://localhost:8080/__detection/api/auth-groups/<authGroupId>
 curl http://localhost:8080/__detection/api/auth-groups/<authGroupId>/path
 ```
 
+## Resolved Actor와 signed dcid
+
+기존 `IP + Header Fingerprint` Actor Candidate는 원시 관찰 단위로 그대로 유지합니다.
+별도의 `dcid` 쿠키는 랜덤 Client ID, 발급/만료 시각과 버전을 HMAC-SHA256으로
+서명합니다. 매 요청에서 서명을 검증하고, 위조·만료·손상된 값은 연결 근거로
+사용하지 않은 채 새 dcid를 발급합니다. IP와 User-Agent는 서명 조건에 포함하지
+않으므로 값이 바뀌어도 유효한 동일 dcid의 Client continuity는 유지됩니다.
+
+응답에서 새로 발급한 dcid는 아직 Client가 반환한 값이 아니므로
+`PROVISIONAL / dcid_issued_not_returned`로 기록합니다. 이후 요청 Cookie에서 동일한
+signed dcid가 실제로 검증된 경우에만 `CONFIRMED`로 승격하며, 최초 발급 요청의
+Membership도 함께 소급 승격해 요청 흐름이 빠지지 않게 합니다.
+
+Resolution의 최소 단위는 Session입니다. 원본 요청을 Resolved Actor에 복사하지 않고
+Session Membership으로 참조하며, 기본 Detection Feature에는 `CONFIRMED` Membership만
+포함합니다. 같은 검증 Account 또는 Auth Group은 Client continuity를 확정하지 않고
+`PROVISIONAL` 또는 `SUGGESTED` 근거로만 기록합니다. Header와 operation 흐름만 같은 경우도
+자동 병합하지 않습니다.
+
+검증된 signed dcid의 가명 Client ID에서는 결정적인 `resolvedActorId`를 생성합니다.
+따라서 동일한 `DCID_HMAC_SECRET`과 클라이언트 쿠키가 유지되면 프록시 재시작 뒤에도
+같은 ID가 재생성됩니다. 다만 요청·점수·Membership 저장소는 여전히 인메모리이므로
+재시작 전의 이력까지 복원되는 것은 아닙니다.
+
+dcid를 반환하지 않는 CLI나 자동화 Agent는 동일 Client로 확정하지 않습니다. 이 경우
+Resolved Actor가 기존 탐지 이력을 가리지 않도록 Actor Candidate와 Auth Group 분석을
+탐지 fallback으로 유지합니다. Dashboard의 기본 `Actor Flow` 화면은 같은 Candidate의
+확정 요청과 미확정 요청을 중복 행 없이 `PARTIALLY_CONFIRMED` 한 행으로 보여줍니다.
+단, 한 Candidate에 여러 CONFIRMED Actor가 섞이면 NAT/공용 환경일 수 있으므로 이를
+합치지 않고 `AMBIGUOUS` Candidate 흐름과 각 확정 Actor를 분리해 표시합니다. 미확정
+요청은 확정 사용자 식별이나 Resolved Feature에는 포함하지 않습니다.
+
+```bash
+curl http://localhost:8080/__detection/api/resolved-actors
+curl http://localhost:8080/__detection/api/resolved-actors/<resolvedActorId>
+curl http://localhost:8080/__detection/api/resolved-actors/<resolvedActorId>/path
+curl http://localhost:8080/__detection/api/resolved-actors/<resolvedActorId>/memberships
+curl http://localhost:8080/__detection/api/resolution-status
+```
+
+운영 환경에서는 최소 `DCID_HMAC_SECRET`과 `ACCOUNT_ID_HASH_KEY`를 고정된 비밀값으로
+설정해야 합니다. 설정하지 않으면 프로세스 수명 동안만 유효한 임시 key를 사용하고
+경고를 출력합니다. Account ID는 `ACCOUNT_JWT_PUBLIC_KEY` 또는
+`ACCOUNT_JWT_PUBLIC_KEY_FILE`로 RS256 공개키가 제공되어 서명이 검증된 경우에만
+`verified`가 됩니다. 공개키가 없으면 JWT claim은 HMAC 가명값으로만 기록되며
+Resolution의 강한 근거로 사용하지 않습니다.
+
+`TRUST_PROXY` 기본값은 `false`이므로 클라이언트가 직접 전송한 `X-Forwarded-For`를
+신뢰하지 않습니다. 신뢰할 Reverse Proxy가 실제로 앞에 있을 때만 hop 수 또는
+`loopback,linklocal,uniquelocal` 같은 신뢰 범위를 명시합니다.
+
 ## Client Actor Candidate
 
 Session 표는 각 `dlsid`에 기록된 요청만으로 점수를 계산합니다. 쿠키를 보존하지 않는
@@ -205,8 +324,10 @@ Automation/Attack Score와 차단 기준에 사용하지 않습니다.
 
 ## Log-only와 실험 Run ID
 
-현재 버전은 `BLOCK_MODE=true`여도 임계치 이상 탐지 결과를 로그로만 기록하며 응답을 403으로
+현재 버전은 `BLOCK_MODE=true`여도 선택한 기준을 넘은 탐지 결과를 로그로만 기록하며 응답을 403으로
 변경하지 않습니다. FPR/FNR 검증 후 별도 차단 정책을 결정할 예정입니다.
+
+서버 로그 판정 기준은 `DETECTION_LEVEL=low|medium|high`로 선택하며 기본값은 `medium`입니다.
 
 실험 환경에서는 다음 설정과 헤더로 ground truth 구간을 표시할 수 있습니다.
 
@@ -222,6 +343,35 @@ X-Experiment-Run-Id: codex-run-001
 Run ID는 형식 검증 후 요청 레코드에만 저장되며 Feature, Score, Actor 식별에 사용되지 않습니다.
 프록시는 이 헤더를 Juice Shop target으로 전달하지 않습니다.
 
+## HTTP Fingerprint V2 관찰 실험
+
+Actor Candidate는 V2 Client Profile과 IP를 기준으로 생성합니다. 기존
+`IP + SHA-1(User-Agent|Accept|Accept-Language|Accept-Encoding)` 값은 비교 검증을 위해
+요청의 `legacyActorId`, `legacyFingerprint`로만 보존합니다. 각 요청에는
+`httpFingerprint`와 호환용 `actorV2Id`도 함께 기록합니다. V2는 다음 두 범주를
+분리합니다.
+
+- Client Profile: User-Agent, 대표 언어, 지원 압축 방식
+- Request Profile: Method, HTTP version, Accept 유형, Content-Type, Referer/Cookie 존재,
+  자격증명과 실험 라벨을 제외한 Header 이름 순서
+
+`Accept`와 Header 순서는 요청 종류에 따라 변하므로 Request Profile에만 포함합니다.
+`X-Attacker-ID`, `X-Experiment-Run-Id`, Authorization, Cookie 값은 V2 지문 재료에서
+명시적으로 제외합니다.
+
+식별용 요청 헤더 없이 재시작 전후 실험을 자동 실행할 수 있습니다.
+
+```bash
+./scripts/http-fingerprint-experiment/run.sh
+```
+
+실험기는 브라우저, 쿠키를 보존하는 동일 HTTP 클라이언트 2개, 쿠키를 보존하지 않는
+HTTP 클라이언트를 순차 실행합니다. Ground truth는 각 실행 전후 export 차이를 외부
+파일로 기록하므로 탐지 요청에는 실험 라벨이 들어가지 않습니다. 고정된 실험용
+`DCID_HMAC_SECRET`을 주입하고 탐지 프록시를 재시작한 뒤 동일 흐름을 반복합니다.
+결과는 `exp/http_fingerprint_no_header/<timestamp>/report.md`와 `evaluation.json`에
+저장됩니다.
+
 ## 한계 및 개선 방향
 
 - 현재는 **인메모리 저장소**라 프록시 재시작 시 세션 데이터가 초기화됩니다. 장기 운영 시 Redis 등으로 교체 권장.
@@ -233,5 +383,8 @@ Run ID는 형식 검증 후 요청 레코드에만 저장되며 Feature, Score, 
 
 컨테이너 빌드는 Apache License 2.0인 OWASP ModSecurity `v3.0.16`과 OWASP Core Rule Set
 `v4.25.1`의 고정 commit을 사용합니다. 버전, source와 라이선스는
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)에 기록했습니다. 프로젝트 전용 adapter,
-누적 집계, API와 대시보드 로직은 외부 구현을 복사한 코드가 아닙니다.
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)에 기록했습니다. 신규 비즈니스 로직 탐지,
+CSRF, 로그인 남용, 가격 무결성 및 스키마 학습 구현은
+[`cattown100/whs_detection2`](https://github.com/cattown100/whs_detection2)의
+커밋 `7f66afb243729ad062a024cb3f11be0c5b2de453`을 기준으로 현재 Resolved Actor,
+백그라운드 트래픽 처리와 LOW/MEDIUM/HIGH 판정 구조에 맞게 통합했습니다.

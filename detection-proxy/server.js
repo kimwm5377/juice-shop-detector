@@ -10,19 +10,30 @@ const { v4: uuidv4 } = require("uuid");
 
 const store = require("./lib/sessionStore");
 const { deriveAuthGroupId } = require("./lib/authGroup");
+const { DcidManager } = require("./lib/dcid");
+const { AccountIdentityResolver } = require("./lib/accountIdentity");
+const { parseTrustProxy, getClientIp } = require("./lib/clientIp");
 const {
   extractFeatures,
   extractActorFeatures,
   extractAuthGroupFeatures,
+  extractResolvedActorFeatures,
   extractIpFeatures,
 } = require("./lib/featureExtractor");
 const { classify } = require("./lib/classifier");
+const { selectEffectiveDetection } = require("./lib/detectionPolicy");
+const {
+  assessDetection,
+  normalizeDetectionLevel,
+  DETECTION_THRESHOLDS,
+} = require("./lib/riskPolicy");
 const { tagPayload } = require("./lib/payloadSignatures");
 const {
   createPayloadFingerprint,
   sanitizeExperimentRunId,
   sanitizeMetadataHeaderValue,
   parseContentLength,
+  normalizePath,
 } = require("./lib/requestMetadata");
 const {
   computeAgenticEvidence,
@@ -30,34 +41,73 @@ const {
 } = require("./lib/agenticEvidence");
 const { CrsScanner } = require("./lib/crsScanner");
 const { DeceptionEngine } = require("./lib/deceptionEngine");
+const { classifyBackgroundTraffic } = require("./lib/backgroundTraffic");
+const {
+  analyzeBusinessLogic,
+  hasHardcodedMassAssignmentWhitelist,
+} = require("./lib/businessLogicSignatures");
+const { checkIdentityMismatch, decodeClaimedIdentity, extractToken } = require("./lib/identityMismatch");
+const { checkRoleGatedAccess, isHardcodedSensitiveRoute } = require("./lib/roleGatedAccess");
+const { checkCsrf, buildAllowedOrigins } = require("./lib/csrfDetection");
+const { extractLoginAttemptEmail } = require("./lib/loginBruteForce");
+const {
+  extractResetPasswordEmail,
+  extractSecurityQuestionEmail,
+} = require("./lib/passwordResetAbuse");
+const { detectPriceTampering } = require("./lib/priceTampering");
+const {
+  ingestProductResponseBody,
+  extractTrailingNumericId,
+  checkPriceDelta,
+  PRODUCTS_LIST_PATH,
+  PRODUCTS_ITEM_PATH,
+} = require("./lib/priceIntegrity");
+const schemaLearning = require("./lib/schemaLearning");
 
 const PORT = process.env.PORT || 8080;
 const TARGET = process.env.TARGET_URL || process.env.JUICE_SHOP_URL || "http://localhost:3000";
+// 2026-09-01 추가: HTML(index.html) 하나만 보는 정찰 대신, 자주 조회되는
+// 정적 텍스트 응답에도 기만 신호를 심는다 — deceptionEngine.injectSignalsPlaintext 참고.
+const PLAINTEXT_BAIT_PATHS = new Set([
+  "/robots.txt",
+  "/security.txt",
+  "/.well-known/security.txt",
+  "/metrics",
+]);
 const BLOCK_MODE = process.env.BLOCK_MODE === "true";
-const LOG_THRESHOLD = parseFloat(process.env.BLOCK_THRESHOLD || "0.75");
+const DETECTION_LEVEL = normalizeDetectionLevel(process.env.DETECTION_LEVEL);
 const ENABLE_EXPERIMENT_RUN_ID = process.env.ENABLE_EXPERIMENT_RUN_ID === "true";
 const EXPERIMENT_RUN_HEADER = "x-experiment-run-id";
 const configuredPayloadFingerprintKey = process.env.PAYLOAD_FINGERPRINT_KEY;
 const PAYLOAD_FINGERPRINT_KEY = configuredPayloadFingerprintKey || crypto.randomBytes(32);
+const CSRF_ALLOWED_ORIGINS = buildAllowedOrigins(
+  (process.env.CSRF_ALLOWED_ORIGINS || `http://localhost:${PORT},http://127.0.0.1:${PORT}`)
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+);
 
 const SESSION_COOKIE = "dlsid";
+const DCID_COOKIE = "dcid";
 const crsScanner = new CrsScanner();
 const deceptionEngine = new DeceptionEngine();
+const dcidManager = new DcidManager();
+const accountIdentityResolver = new AccountIdentityResolver();
 
 const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", parseTrustProxy());
 app.use(cookieParser());
-
-function getClientIp(req) {
-  const xf = req.headers["x-forwarded-for"];
-  if (xf) return xf.split(",")[0].trim();
-  return req.socket.remoteAddress || "unknown";
-}
 
 function analyzeSession(session) {
   const features = extractFeatures(session);
+  const analysis = classify(features);
   return {
-    ...classify(features),
+    ...analysis,
+    detection: assessDetection(
+      { ...analysis, maxAttackScore: session.attackHistory?.maxAttackScore },
+      { level: DETECTION_LEVEL }
+    ),
     features,
     agenticEvidence: computeAgenticEvidence(session.requests),
   };
@@ -65,8 +115,13 @@ function analyzeSession(session) {
 
 function analyzeActor(actor) {
   const features = extractActorFeatures(actor, store.getSession);
+  const analysis = classify(features);
   return {
-    ...classify(features),
+    ...analysis,
+    detection: assessDetection(
+      { ...analysis, maxAttackScore: actor.attackHistory?.maxAttackScore },
+      { level: DETECTION_LEVEL }
+    ),
     features,
     agenticEvidence: computeAgenticEvidence(actor.requests),
   };
@@ -74,12 +129,123 @@ function analyzeActor(actor) {
 
 function analyzeAuthGroup(group) {
   const features = extractAuthGroupFeatures(group, store.getSession);
+  const analysis = classify(features);
   return {
-    ...classify(features),
+    ...analysis,
+    detection: assessDetection(
+      { ...analysis, maxAttackScore: group.attackHistory?.maxAttackScore },
+      { level: DETECTION_LEVEL }
+    ),
     features,
     // 동일 token을 공유하는 서로 다른 Actor의 transition은 연결하지 않는다.
     agenticEvidence: computePartitionedAgenticEvidence(group.requests),
   };
+}
+
+function analyzeResolvedActor(aggregate) {
+  const features = extractResolvedActorFeatures(aggregate);
+  const analysis = classify(features);
+  return {
+    ...analysis,
+    detection: assessDetection(
+      { ...analysis, maxAttackScore: aggregate.attackHistory?.maxAttackScore },
+      { level: DETECTION_LEVEL }
+    ),
+    features,
+    agenticEvidence: computeAgenticEvidence(aggregate.requests),
+  };
+}
+
+function computeBusinessLogicTags(req) {
+  const normalizedPath = normalizePath(req.originalUrl);
+  const businessLogicHits = analyzeBusinessLogic({
+    method: req.method,
+    normalizedPath,
+    body: req.body,
+    rawQueryOrBody: req.originalUrl,
+  });
+  const identityHits = checkIdentityMismatch({
+    method: req.method,
+    normalizedPath,
+    url: req.originalUrl,
+    body: req.body,
+    authorizationHeader: req.headers.authorization,
+    cookieHeader: req.headers.cookie,
+  });
+  const roleGateHits = checkRoleGatedAccess({
+    method: req.method,
+    normalizedPath,
+    authorizationHeader: req.headers.authorization,
+    cookieHeader: req.headers.cookie,
+  });
+  const priceResult = detectPriceTampering(req.body);
+  const tags = [
+    ...businessLogicHits.map((hit) => hit.tag),
+    ...identityHits.map((hit) => hit.tag),
+    ...roleGateHits.map((hit) => hit.tag),
+  ];
+  if (priceResult.hit) tags.push("price-tampering:total-mismatch");
+
+  if (String(req.method).toUpperCase() === "PUT" && normalizedPath === PRODUCTS_ITEM_PATH) {
+    const productId = extractTrailingNumericId(req.originalUrl);
+    const submittedPrice = req.body && typeof req.body === "object" ? req.body.price : undefined;
+    if (checkPriceDelta(productId, submittedPrice).hit) tags.push("price-tampering:delta");
+  }
+  return [...new Set(tags)];
+}
+
+function computeCsrfTags(req) {
+  return checkCsrf(
+    {
+      method: req.method,
+      normalizedPath: normalizePath(req.originalUrl),
+      originHeader: req.headers.origin,
+      refererHeader: req.headers.referer,
+    },
+    CSRF_ALLOWED_ORIGINS
+  ).map((hit) => hit.tag);
+}
+
+function observeSchemaLearning(req, statusCode, normalizedPath) {
+  let bodyObj = req.body;
+  if (typeof bodyObj === "string") {
+    try {
+      bodyObj = JSON.parse(bodyObj);
+    } catch {
+      bodyObj = null;
+    }
+  }
+
+  schemaLearning.observeMassAssignment({
+    method: req.method,
+    normalizedPath,
+    bodyObj,
+    statusCode,
+    hasHardcodedWhitelist: hasHardcodedMassAssignmentWhitelist(req.method, normalizedPath),
+  });
+
+  const token = extractToken(req.headers.authorization, req.headers.cookie);
+  const claimed = token ? decodeClaimedIdentity(token) : null;
+  const role = claimed?.role ? String(claimed.role).toLowerCase() : null;
+  schemaLearning.observeRoleAccess({
+    method: req.method,
+    normalizedPath,
+    statusCode,
+    role,
+    hasHardcodedRule: isHardcodedSensitiveRoute(req.method, normalizedPath),
+  });
+
+  const requestedId = extractTrailingNumericId(req.originalUrl);
+  const claimedIds = claimed
+    ? [claimed.id, claimed.bid].filter((value) => value !== null && value !== undefined)
+    : [];
+  schemaLearning.observeIdentityAccess({
+    method: req.method,
+    normalizedPath,
+    statusCode,
+    requestedId,
+    claimedIds,
+  });
 }
 
 function prepareRequestObservation(req) {
@@ -90,6 +256,7 @@ function prepareRequestObservation(req) {
     ? sanitizeExperimentRunId(req.headers[EXPERIMENT_RUN_HEADER])
     : null;
   req.authGroupId = deriveAuthGroupId(req.headers.authorization);
+  req.accountIdentity = accountIdentityResolver.inspectAuthorization(req.headers.authorization);
   req.hasAuthorization = typeof req.headers.authorization === "string";
   req.detectionHeaders = store.withoutSensitiveHeaders(req.headers);
   req.payloadFingerprint = createPayloadFingerprint(
@@ -103,6 +270,25 @@ function prepareRequestObservation(req) {
     url: req.originalUrl,
     rawBody: req.detectionRequestBodyBuffer,
     body: req.body,
+  });
+  req.backgroundTraffic = classifyBackgroundTraffic(req.originalUrl);
+  const normalizedPath = normalizePath(req.originalUrl);
+  req.blTags = computeBusinessLogicTags(req);
+  req.csrfTags = computeCsrfTags(req);
+  req.loginAttemptEmail = extractLoginAttemptEmail({
+    method: req.method,
+    normalizedPath,
+    body: req.body,
+  });
+  req.resetPasswordEmail = extractResetPasswordEmail({
+    method: req.method,
+    normalizedPath,
+    body: req.body,
+  });
+  req.securityQuestionEmail = extractSecurityQuestionEmail({
+    method: req.method,
+    normalizedPath,
+    url: req.originalUrl,
   });
 }
 
@@ -121,13 +307,22 @@ function recordCompletedRequest(req, {
     hits: [],
   };
   const tags = detection.available ? detection.categories : tagPayload(req.originalUrl, req.body);
+  const normalizedPath = normalizePath(req.originalUrl);
+  observeSchemaLearning(req, status, normalizedPath);
   const session = store.recordRequest(req.detectionSessionId, ip, {
     method: req.method,
     url: req.originalUrl,
     status,
     headers: req.detectionHeaders,
+    rawHeaders: req.rawHeaders,
+    httpVersion: req.httpVersion,
     body: deceptionEngine.redactBodyForLog(req.body),
     tags,
+    blTags: req.blTags,
+    csrfTags: req.csrfTags,
+    loginAttemptEmail: req.loginAttemptEmail,
+    resetPasswordEmail: req.resetPasswordEmail,
+    securityQuestionEmail: req.securityQuestionEmail,
     authGroupId: req.authGroupId,
     payloadFingerprint: req.payloadFingerprint,
     hasAuthorization: req.hasAuthorization,
@@ -143,7 +338,10 @@ function recordCompletedRequest(req, {
       : parseContentLength(responseContentLength),
     responseBodyBytes,
     attackDetection: detection,
+    backgroundTraffic: req.backgroundTraffic,
     deceptionEvents: req.deceptionEvents,
+    clientIdentity: req.clientIdentity,
+    accountIdentity: req.accountIdentity,
   });
 
   const sessionAnalysis = analyzeSession(session);
@@ -152,6 +350,17 @@ function recordCompletedRequest(req, {
   const actorAnalysis = actor ? analyzeActor(actor) : sessionAnalysis;
   const authGroup = req.authGroupId ? store.getAuthGroup(req.authGroupId) : null;
   const authGroupAnalysis = authGroup ? analyzeAuthGroup(authGroup) : null;
+  const resolvedActorId = session.requests.at(-1)?.resolvedActorId;
+  const resolvedActor = resolvedActorId
+    ? store.getResolvedActorAggregate(resolvedActorId)
+    : null;
+  const resolvedActorAnalysis = resolvedActor ? analyzeResolvedActor(resolvedActor) : null;
+  const [effectiveDetectionSource, effectiveDetectionAnalysis] = selectEffectiveDetection({
+    session: sessionAnalysis,
+    candidate: actorAnalysis,
+    authGroup: authGroupAnalysis,
+    resolved: resolvedActorAnalysis,
+  });
   store.updateAttackScoreHistory({
     sessionId: session.id,
     actorId,
@@ -162,7 +371,15 @@ function recordCompletedRequest(req, {
       authGroup: authGroupAnalysis?.attackScore,
     },
   });
-  return { session, sessionAnalysis, actorAnalysis, authGroupAnalysis };
+  return {
+    session,
+    sessionAnalysis,
+    actorAnalysis,
+    authGroupAnalysis,
+    resolvedActorAnalysis,
+    effectiveDetectionSource,
+    effectiveDetectionAnalysis,
+  };
 }
 
 // 세션 쿠키 부여 (없으면 새로 발급)
@@ -173,6 +390,23 @@ app.use((req, res, next) => {
     res.cookie(SESSION_COOKIE, sid, { httpOnly: false, sameSite: "lax" });
   }
   req.detectionSessionId = sid;
+  next();
+});
+
+// dlsid와 별도로 서명된 지속 Client ID를 검증한다. 잘못된 값은 연결 근거로
+// 사용하지 않고 즉시 새 dcid를 발급한다. HMAC secret 자체는 클라이언트에 노출되지 않는다.
+app.use((req, res, next) => {
+  const verification = dcidManager.verify(req.cookies[DCID_COOKIE]);
+  if (verification.valid) {
+    req.clientIdentity = verification;
+    return next();
+  }
+  const issued = dcidManager.issue();
+  req.clientIdentity = {
+    ...issued.identity,
+    replacedReason: verification.reason,
+  };
+  res.cookie(DCID_COOKIE, issued.value, dcidManager.cookieOptions(issued.identity));
   next();
 });
 
@@ -200,6 +434,8 @@ app.use((req, res, next) => {
     sessionId: req.detectionSessionId,
     method: req.method,
     url: req.originalUrl,
+    rawBody: req.detectionRequestBodyBuffer,
+    body: req.body,
   });
   if (!trap) return next();
 
@@ -229,6 +465,7 @@ app.get("/__detection/api/sessions", (req, res) => {
     return {
       sessionId: s.id,
       actorId: s.actorId,
+      resolvedActorId: s.resolvedActorId,
       ip: s.ip,
       ...analyzeSession(s),
       attackHistory: s.attackHistory,
@@ -247,6 +484,8 @@ app.get("/__detection/api/sessions/:id", (req, res) => {
     sessionId: s.id,
     actorId: s.actorId,
     actorIds: Array.from(s.actorIds),
+    resolvedActorId: s.resolvedActorId,
+    resolutionMembershipId: s.resolutionMembershipId,
     ip: s.ip,
     ...analyzeSession(s),
     attackHistory: s.attackHistory,
@@ -269,10 +508,77 @@ app.get("/__detection/api/sessions/:id/path", (req, res) => {
   });
 });
 
+function resolvedActorJson(aggregate, { includeRequests = false, includeMemberships = false } = {}) {
+  const analysis = analyzeResolvedActor(aggregate);
+  const result = {
+    resolvedActorId: aggregate.id,
+    status: aggregate.status,
+    confidence: aggregate.confidence,
+    firstSeen: aggregate.firstSeen,
+    lastSeen: aggregate.lastSeen,
+    sessionIds: aggregate.sessionIds,
+    observedSessionIds: aggregate.observedSessionIds,
+    candidateIds: aggregate.candidateIds,
+    sessionCount: aggregate.sessionIds.length,
+    observedSessionCount: aggregate.observedSessionIds.length,
+    candidateCount: aggregate.candidateIds.length,
+    confirmedMembershipCount: aggregate.confirmedMemberships.length,
+    provisionalMembershipCount: aggregate.provisionalMemberships.length,
+    observedIps: aggregate.observedIps,
+    ipFirstSeen: aggregate.ipFirstSeen,
+    ipLastSeen: aggregate.ipLastSeen,
+    ipChangeCount: aggregate.ipChangeCount,
+    clientIds: aggregate.clientIds,
+    accountAffiliations: aggregate.accountAffiliations,
+    authGroupIds: aggregate.authGroupIds,
+    evidence: aggregate.evidence,
+    conflicts: aggregate.conflicts,
+    continuityConfirmed: aggregate.continuityConfirmed,
+    observedTotalRequests: aggregate.observedTotalRequests,
+    totalRequests: aggregate.totalRequests,
+    aggregationPolicy: aggregate.aggregationPolicy,
+    attackHistory: aggregate.attackHistory,
+    deceptionHistory: aggregate.deceptionHistory,
+    ...analysis,
+  };
+  if (includeMemberships) result.memberships = aggregate.memberships;
+  if (includeRequests) result.requests = aggregate.requests;
+  return result;
+}
+
+app.get("/__detection/api/resolved-actors", (req, res) => {
+  res.json(store.getAllResolvedActorAggregates().map((aggregate) => resolvedActorJson(aggregate)));
+});
+
+app.get("/__detection/api/resolved-actors/:id", (req, res) => {
+  const aggregate = store.getResolvedActorAggregate(req.params.id);
+  if (!aggregate) return res.status(404).json({ error: "not found" });
+  res.json(resolvedActorJson(aggregate, { includeRequests: true, includeMemberships: true }));
+});
+
+app.get("/__detection/api/resolved-actors/:id/path", (req, res) => {
+  const aggregate = store.getResolvedActorAggregate(req.params.id);
+  if (!aggregate) return res.status(404).json({ error: "not found" });
+  res.json({
+    resolvedActorId: aggregate.id,
+    aggregationPolicy: aggregate.aggregationPolicy,
+    sessionIds: aggregate.sessionIds,
+    candidateIds: aggregate.candidateIds,
+    requests: aggregate.requests,
+  });
+});
+
+app.get("/__detection/api/resolved-actors/:id/memberships", (req, res) => {
+  const memberships = store.getResolutionMemberships(req.params.id);
+  if (!memberships) return res.status(404).json({ error: "not found" });
+  res.json({ resolvedActorId: req.params.id, memberships });
+});
+
 app.get("/__detection/api/actors", (req, res) => {
   const result = store.getAllActors().map((actor) => {
     return {
       actorId: actor.id,
+      resolvedActorIds: [...new Set(actor.requests.map((request) => request.resolvedActorId).filter(Boolean))],
       ip: actor.ip,
       fingerprint: actor.fingerprint,
       ...analyzeActor(actor),
@@ -292,6 +598,7 @@ app.get("/__detection/api/actors/:id", (req, res) => {
   if (!actor) return res.status(404).json({ error: "not found" });
   res.json({
     actorId: actor.id,
+    resolvedActorIds: [...new Set(actor.requests.map((request) => request.resolvedActorId).filter(Boolean))],
     ip: actor.ip,
     fingerprint: actor.fingerprint,
     ...analyzeActor(actor),
@@ -323,6 +630,7 @@ app.get("/__detection/api/auth-groups", (req, res) => {
   const result = store.getAllAuthGroups().map((group) => {
     return {
       authGroupId: group.id,
+      resolvedActorIds: [...new Set(group.requests.map((request) => request.resolvedActorId).filter(Boolean))],
       ...analyzeAuthGroup(group),
       attackHistory: group.attackHistory,
       deceptionHistory: group.deceptionHistory,
@@ -341,6 +649,7 @@ app.get("/__detection/api/auth-groups/:id", (req, res) => {
   if (!group) return res.status(404).json({ error: "not found" });
   res.json({
     authGroupId: group.id,
+    resolvedActorIds: [...new Set(group.requests.map((request) => request.resolvedActorId).filter(Boolean))],
     ...analyzeAuthGroup(group),
     attackHistory: group.attackHistory,
     deceptionHistory: group.deceptionHistory,
@@ -399,6 +708,15 @@ app.get("/__detection/api/deception-status", (req, res) => {
   res.json(deceptionEngine.status());
 });
 
+app.get("/__detection/api/resolution-status", (req, res) => {
+  res.json({
+    ...store.getResolutionStatus(),
+    dcid: dcidManager.status(),
+    accountIdentity: accountIdentityResolver.status(),
+    trustProxy: app.get("trust proxy"),
+  });
+});
+
 // Auth Group의 공격 경로 = 동일 Bearer token을 쓴 모든 세션의 시간순 요청 타임라인
 app.get("/__detection/api/auth-groups/:id/path", (req, res) => {
   const group = store.getAuthGroup(req.params.id);
@@ -417,6 +735,7 @@ app.get("/__detection/api/export", (req, res) => {
     return {
       sessionId: s.id,
       actorId: s.actorId,
+      resolvedActorId: s.resolvedActorId,
       ip: s.ip,
       userAgent: s.userAgent,
       firstSeen: s.firstSeen,
@@ -429,6 +748,69 @@ app.get("/__detection/api/export", (req, res) => {
   });
   res.setHeader("Content-Disposition", "attachment; filename=detection-log-export.json");
   res.json(result);
+});
+
+app.get("/__detection/api/schema-learning/candidates", (req, res) => {
+  res.json(schemaLearning.listCandidates());
+});
+
+app.post("/__detection/api/schema-learning/mass-assignment/approve", (req, res) => {
+  const { key, fields } = req.body || {};
+  if (!key) return res.status(400).json({ error: "key required" });
+  if (!schemaLearning.approveMassAssignment(key, fields)) {
+    return res.status(404).json({ error: "candidate not found" });
+  }
+  res.json({ approved: true, key });
+});
+
+app.post("/__detection/api/schema-learning/mass-assignment/reject", (req, res) => {
+  const { key } = req.body || {};
+  if (!key) return res.status(400).json({ error: "key required" });
+  if (!schemaLearning.rejectMassAssignment(key)) {
+    return res.status(404).json({ error: "candidate not found" });
+  }
+  res.json({ rejected: true, key });
+});
+
+app.post("/__detection/api/schema-learning/role-gated/approve", (req, res) => {
+  const { key, requiredRoles } = req.body || {};
+  if (!key) return res.status(400).json({ error: "key required" });
+  if (!schemaLearning.approveRoleGated(key, requiredRoles)) {
+    return res.status(404).json({ error: "candidate not found" });
+  }
+  res.json({ approved: true, key });
+});
+
+app.post("/__detection/api/schema-learning/role-gated/reject", (req, res) => {
+  const { key } = req.body || {};
+  if (!key) return res.status(400).json({ error: "key required" });
+  if (!schemaLearning.rejectRoleGated(key)) {
+    return res.status(404).json({ error: "candidate not found" });
+  }
+  res.json({ rejected: true, key });
+});
+
+app.post("/__detection/api/schema-learning/identity/approve", (req, res) => {
+  const { key } = req.body || {};
+  if (!key) return res.status(400).json({ error: "key required" });
+  if (!schemaLearning.approveIdentityCandidate(key)) {
+    return res.status(404).json({ error: "candidate not found" });
+  }
+  res.json({ approved: true, key });
+});
+
+app.post("/__detection/api/schema-learning/identity/reject", (req, res) => {
+  const { key } = req.body || {};
+  if (!key) return res.status(400).json({ error: "key required" });
+  if (!schemaLearning.rejectIdentityCandidate(key)) {
+    return res.status(404).json({ error: "candidate not found" });
+  }
+  res.json({ rejected: true, key });
+});
+
+app.post("/__detection/api/schema-learning/reset", (_req, res) => {
+  schemaLearning.resetAll();
+  res.json({ reset: true });
 });
 
 // 등록되지 않은 탐지 내부 경로가 Juice Shop 프록시로 흘러가 탐지 요청으로
@@ -458,7 +840,11 @@ app.use(
       const attackDetection = req.crsScanPromise
         ? await req.crsScanPromise
         : { available: false, error: "scan was not started", categories: [], hits: [] };
-      const { session, sessionAnalysis, actorAnalysis } = recordCompletedRequest(req, {
+      const {
+        session,
+        effectiveDetectionSource,
+        effectiveDetectionAnalysis,
+      } = recordCompletedRequest(req, {
         status: proxyRes.statusCode,
         responseContentType: proxyRes.headers["content-type"],
         responseContentLength: proxyRes.headers["content-length"],
@@ -468,16 +854,19 @@ app.use(
 
       // 실험 검증 전에는 BLOCK_MODE도 log-only다. 응답 상태나 body를 변경하지 않는다.
       if (BLOCK_MODE) {
-        const actorSeverity = Math.max(actorAnalysis.attackScore, actorAnalysis.automationScore);
-        const sessionSeverity = Math.max(sessionAnalysis.attackScore, sessionAnalysis.automationScore);
-        const source = actorSeverity > sessionSeverity ? "actor" : "session";
-        const selected = source === "actor" ? actorAnalysis : sessionAnalysis;
         if (
-          selected.attackScore >= LOG_THRESHOLD ||
-          selected.automationScore >= LOG_THRESHOLD
+          effectiveDetectionAnalysis.detection?.automationDetected ||
+          effectiveDetectionAnalysis.detection?.attackDetected
         ) {
           console.warn(
-            `[detection-proxy][log-only] ${source} automation=${selected.automationScore} attack=${selected.attackScore}`
+            `[detection-proxy][log-only] ${effectiveDetectionSource} ` +
+            `level=${DETECTION_LEVEL} ` +
+            `threshold=${DETECTION_THRESHOLDS[DETECTION_LEVEL]} ` +
+            `automationDetected=${effectiveDetectionAnalysis.detection.automationDetected} ` +
+            `attackDetected=${effectiveDetectionAnalysis.detection.attackDetected} ` +
+            `automation=${effectiveDetectionAnalysis.automationScore} ` +
+            `attackCurrent=${effectiveDetectionAnalysis.attackScore} ` +
+            `attackMax=${effectiveDetectionAnalysis.detection.effectiveAttackScore}`
           );
         }
       }
@@ -498,6 +887,30 @@ app.use(
         return injected;
       }
 
+      const normalizedPath = normalizePath(req.originalUrl);
+      if (
+        String(req.method).toUpperCase() === "GET" &&
+        (normalizedPath === PRODUCTS_LIST_PATH || normalizedPath === PRODUCTS_ITEM_PATH) &&
+        contentType.includes("application/json")
+      ) {
+        try {
+          ingestProductResponseBody(JSON.parse(responseBuffer.toString("utf8")));
+        } catch {
+          // 가격 기준 캐시는 관찰 가능한 정상 JSON 응답만 best-effort로 반영한다.
+        }
+      }
+
+      // 2026-09-01 추가: HTML(index.html) 하나만 보는 게 아니라, 정찰 목적으로
+      // 자주 조회되는 다른 정적 텍스트 응답(포맷 자체가 "#"/"//" 주석을
+      // 지원하는 곳)에도 같은 신호를 심는다 — deceptionEngine.injectSignals*
+      // 참고 주석.
+      if (PLAINTEXT_BAIT_PATHS.has(req.path)) {
+        return deceptionEngine.injectSignalsPlaintext(responseBuffer.toString("utf8"), session.id);
+      }
+      if (req.path.endsWith(".js") || contentType.includes("javascript")) {
+        return deceptionEngine.injectSignalsJs(responseBuffer.toString("utf8"), session.id);
+      }
+
       return responseBuffer;
     }),
   })
@@ -507,9 +920,14 @@ app.listen(PORT, () => {
   console.log(`[detection-proxy] listening on :${PORT} -> proxying ${TARGET}`);
   console.log(`[detection-proxy] dashboard: http://localhost:${PORT}/__detection/dashboard`);
   console.log(
-    `[detection-proxy] BLOCK_MODE=${BLOCK_MODE} (log-only) threshold=${LOG_THRESHOLD}`
+    `[detection-proxy] BLOCK_MODE=${BLOCK_MODE} (log-only) ` +
+    `level=${DETECTION_LEVEL} threshold=${DETECTION_THRESHOLDS[DETECTION_LEVEL]}`
   );
   console.log(`[detection-proxy] experiment run header enabled=${ENABLE_EXPERIMENT_RUN_ID}`);
+  console.log(`[detection-proxy] trust proxy=${JSON.stringify(app.get("trust proxy"))}`);
+  console.log(`[detection-proxy] DCID status=${JSON.stringify(dcidManager.status())}`);
+  console.log(`[detection-proxy] Account identity status=${JSON.stringify(accountIdentityResolver.status())}`);
+  console.log(`[detection-proxy] Resolution status=${JSON.stringify(store.getResolutionStatus())}`);
   console.log(`[detection-proxy] CRS status=${JSON.stringify(crsScanner.status())}`);
   console.log(`[detection-proxy] Deception status=${JSON.stringify(deceptionEngine.status())}`);
   if (!configuredPayloadFingerprintKey) {

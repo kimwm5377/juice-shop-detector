@@ -1,4 +1,5 @@
 const { FEATURE_WINDOWS } = require("./featureWindows");
+const { isBehaviorAnalyzable } = require("./backgroundTraffic");
 
 function emptyAgenticEvidence() {
   return {
@@ -18,6 +19,7 @@ function mergeAgenticEvidence(target, source) {
 function computeAgenticEvidence(requests = []) {
   const evidence = emptyAgenticEvidence();
   const recent = [...requests]
+    .filter(isBehaviorAnalyzable)
     .sort((a, b) => a.ts - b.ts)
     .slice(-FEATURE_WINDOWS.agenticRequests);
 

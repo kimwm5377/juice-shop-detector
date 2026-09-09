@@ -1,1 +1,5 @@
 detection-proxy/node_modules/
+**/*:Zone.Identifier
+detection-proxy/data/schema-learning.json
+**/__pycache__/
+*.pyc

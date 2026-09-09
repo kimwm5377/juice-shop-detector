@@ -29,12 +29,12 @@ function record(sessionId, ip, url, headers) {
 
 test("동일 IP에서도 헤더 fingerprint가 다르면 별도 Actor로 분리된다", () => {
   const ip = "::ffff:10.10.0.1";
-  record("actor-browser-a", ip, "/browser/a", browserHeaders);
+  const browserSession = record("actor-browser-a", ip, "/browser/a", browserHeaders);
   record("actor-browser-b", ip, "/browser/b", browserHeaders);
-  record("actor-cli-a", ip, "/cli/a", cliHeaders);
+  const cliSession = record("actor-cli-a", ip, "/cli/a", cliHeaders);
 
-  const browserActorId = store.deriveActorId(ip, store.headerFingerprint(browserHeaders));
-  const cliActorId = store.deriveActorId(ip, store.headerFingerprint(cliHeaders));
+  const browserActorId = browserSession.actorId;
+  const cliActorId = cliSession.actorId;
   assert.notEqual(browserActorId, cliActorId);
 
   const browserActor = store.getActor(browserActorId);
@@ -43,6 +43,22 @@ test("동일 IP에서도 헤더 fingerprint가 다르면 별도 Actor로 분리�
   assert.equal(browserActor.sessionIds.size, 2);
   assert.equal(cliActor.totalRequests, 1);
   assert.equal(cliActor.sessionIds.size, 1);
+});
+
+test("Accept가 자원별로 달라도 V2 Client Profile은 동일 Actor로 묶는다", () => {
+  const ip = "::ffff:10.10.0.11";
+  const document = record("v2-document", ip, "/", {
+    ...browserHeaders,
+    accept: "text/html,application/xhtml+xml",
+  });
+  const api = record("v2-api", ip, "/api/Products/", {
+    ...browserHeaders,
+    accept: "application/json",
+  });
+
+  assert.equal(document.actorId, api.actorId);
+  assert.notEqual(document.requests[0].legacyActorId, api.requests[0].legacyActorId);
+  assert.equal(store.getActor(document.actorId).totalRequests, 2);
 });
 
 test("Session feature는 Actor의 다른 세션 요청을 물려받지 않는다", () => {
@@ -82,6 +98,7 @@ test("확장 요청 레코드는 식별자와 operation을 저장하고 민감 �
     status: 401,
     headers: {
       authorization: "Bearer raw-token",
+      cookie: "token=raw-token; dcid=raw-client-cookie",
       "x-experiment-run-id": "codex-run-001",
       "user-agent": "curl/8.0",
     },
@@ -114,10 +131,11 @@ test("확장 요청 레코드는 식별자와 operation을 저장하고 민감 �
   assert.equal(request.responseContentLength, 42);
   assert.equal(request.responseBodyBytes, 42);
   assert.equal(JSON.stringify(session.headerSample).includes("raw-token"), false);
+  assert.equal(session.headerSample.cookie, undefined);
   assert.equal(session.headerSample["x-experiment-run-id"], undefined);
 });
 
-test("최근 50개 요청에서 공격이 밀려나도 CRS 누적 공격 이력은 유지된다", () => {
+test("50개가 넘는 정상 요청 뒤에도 lifecycle Attack Feature와 누적 이력이 유지된다", () => {
   const sessionId = "crs-history-survives-window";
   const ip = "127.0.0.77";
   const detectedAt = 1_700_000_000_000;
@@ -146,8 +164,9 @@ test("최근 50개 요청에서 공격이 밀려나도 CRS 누적 공격 이력�
   }
 
   const features = extractFeatures(session);
-  assert.equal(features.attack.crsRuleHits, 0);
-  assert.equal(features.attack.payloadSignatureHits, 0);
+  assert.equal(features.attack.sampleSize, 56);
+  assert.equal(features.attack.crsRuleHits, 2);
+  assert.equal(features.attack.payloadSignatureHits, 1);
   assert.deepEqual(session.attackHistory, {
     hasAttackHistory: true,
     maxAttackScore: 0,

@@ -12,10 +12,14 @@ const AUTOMATION_WEIGHTS = Object.freeze({
 });
 
 const ATTACK_WEIGHTS = Object.freeze({
-  payloadSignature: 0.55,
-  notFoundExploration: 0.05,
-  accessDeniedExploration: 0.05,
-  attackHoney: 0.35,
+  payloadSignature: 0.3,
+  notFoundExploration: 0.06,
+  accessDeniedExploration: 0.06,
+  idorWalk: 0.07,
+  loginBruteForce: 0.08,
+  businessLogicViolation: 0.12,
+  csrf: 0.09,
+  attackHoney: 0.22,
 });
 
 const AUTOMATION_HONEY_MAX_POINTS = 35;
@@ -45,6 +49,8 @@ const NORMALIZATION = Object.freeze({
   consecutiveBaseline: 2,
   consecutiveRange: 8,
   errorRatioHigh: 0.4,
+  idorWalkRange: 5,
+  loginBruteForceRange: 9,
 });
 
 function scoreTimingRegularity(features) {
@@ -95,8 +101,11 @@ function scoreHeaderAnomaly(features) {
 
 function scoreBrowserInteraction(features) {
   const interaction = features.client.browserInteraction;
-  if (!interaction.hasTelemetry) return features.totalRequests >= 3 ? 0.9 : 0.5;
-  if (features.totalRequests < 5) return 0;
+  const analyzedRequests = Number.isFinite(features.behaviorAnalyzedRequests)
+    ? features.behaviorAnalyzedRequests
+    : features.totalRequests;
+  if (!interaction.hasTelemetry) return analyzedRequests >= 3 ? 0.9 : 0.5;
+  if (analyzedRequests < 5) return 0;
   const mouse = interaction.mouseMoveCount === 0 ? 1 : clamp(1 - interaction.mouseMoveCount / 30);
   const scroll = interaction.scrollCount === 0 ? 1 : clamp(1 - interaction.scrollCount / 10);
   const dom = clamp(1 - interaction.domEventDiversity / 5);
@@ -116,6 +125,36 @@ function scoreNotFoundExploration(features) {
 
 function scoreAccessDeniedExploration(features) {
   return clamp(features.exploration.accessDeniedRatio / NORMALIZATION.errorRatioHigh);
+}
+
+function scoreIdorWalk(features) {
+  const signal = features.attack.idorWalk;
+  if (!signal || signal.maxDistinctIdsPerResource < 1) return 0;
+  return clamp((signal.maxDistinctIdsPerResource - 1) / NORMALIZATION.idorWalkRange);
+}
+
+function scoreLoginBruteForce(features) {
+  const signal = features.attack.loginBruteForce;
+  if (!signal || signal.distinctEmailsAttempted < 1) return 0;
+  const repeated = clamp(
+    (signal.maxAttemptsPerEmail - 1) / NORMALIZATION.loginBruteForceRange
+  );
+  const stuffing = clamp(
+    (signal.distinctEmailsAttempted - 1) / NORMALIZATION.loginBruteForceRange
+  );
+  return Math.max(repeated, stuffing);
+}
+
+function scoreBusinessLogicViolation(features) {
+  const attack = features.attack;
+  if (!attack.businessLogicHits) return 0;
+  return clamp(0.7 + clamp((attack.distinctBusinessLogicCategories - 1) / 3) * 0.3);
+}
+
+function scoreCsrf(features) {
+  const attack = features.attack;
+  if (!attack.csrfHits) return 0;
+  return clamp(0.7 + clamp((attack.distinctCsrfCategories - 1) / 2) * 0.3);
 }
 
 function hasDeceptionSignal(features, signal) {
@@ -182,6 +221,10 @@ function classify(features) {
     payloadSignature: scorePayloadSignature(features),
     notFoundExploration: scoreNotFoundExploration(features),
     accessDeniedExploration: scoreAccessDeniedExploration(features),
+    idorWalk: scoreIdorWalk(features),
+    loginBruteForce: scoreLoginBruteForce(features),
+    businessLogicViolation: scoreBusinessLogicViolation(features),
+    csrf: scoreCsrf(features),
     attackHoney: attackHoney.score,
   };
 

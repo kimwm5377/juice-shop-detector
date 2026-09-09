@@ -70,3 +70,18 @@ test("actorId가 없으면 sessionId를 fallback partition으로 사용한다", 
   ]);
   assert.equal(partitioned.failureChangeSuccessCount, 1);
 });
+
+test("Socket.IO background traffic은 Agentic Evidence 전이를 끊거나 만들지 않는다", () => {
+  const evidence = computeAgenticEvidence([
+    request({ ts: 0, path: "/login", status: 401, payload: "old" }),
+    {
+      ...request({ ts: 500, path: "/socket.io/", method: "GET", status: 200 }),
+      backgroundTraffic: { isBackground: true, category: "socket_io_polling" },
+    },
+    request({ ts: 1_000, path: "/login", status: 200, payload: "new" }),
+  ]);
+
+  assert.equal(evidence.retryWithPayloadChangeCount, 1);
+  assert.equal(evidence.failureChangeSuccessCount, 1);
+  assert.equal(evidence.errorToEndpointChangeCount, 0);
+});

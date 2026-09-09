@@ -1,6 +1,8 @@
 const crypto = require("crypto");
 const { normalizePath } = require("./requestMetadata");
 const { DECEPTION_SIGNAL_CATALOG } = require("./deceptionEngine");
+const { ActorResolver, MEMBERSHIP_STATUS } = require("./actorResolver");
+const { buildHttpFingerprint } = require("./httpFingerprint");
 
 // 세션 단위 데이터: 요청 로그 + 클라이언트 텔레메트리
 const sessions = new Map();
@@ -11,14 +13,18 @@ const actors = new Map();
 const authGroups = new Map();
 // 동일 IP 전체 트래픽 관찰용. NAT/Docker에서 여러 클라이언트가 섞일 수 있어 점수/차단에 쓰지 않는다.
 const ipEntries = new Map();
+// Session 단위 Resolution Assignment를 관리하며 원본 요청은 복사하지 않는다.
+const actorResolver = new ActorResolver();
 
 const MAX_REQUESTS_PER_SESSION = 500; // 메모리 보호용 링버퍼 상한
 const MAX_REQUESTS_PER_AUTH_GROUP = MAX_REQUESTS_PER_SESSION * 2;
 const MAX_REQUESTS_PER_IP_ENTRY = MAX_REQUESTS_PER_SESSION * 2;
+const MAX_REQUESTS_PER_RESOLVED_ACTOR = MAX_REQUESTS_PER_SESSION * 2;
 
 const SENSITIVE_DETECTION_HEADERS = new Set([
   "authorization",
   "proxy-authorization",
+  "cookie",
   "x-experiment-run-id",
 ]);
 
@@ -171,6 +177,8 @@ function getOrCreateSession(sessionId, ip) {
       fingerprint: null,
       actorId: null,
       actorIds: new Set(),
+      resolvedActorId: null,
+      resolutionMembershipId: null,
       userAgent: null,
       attackHistory: emptyAttackHistory(),
       deceptionHistory: emptyDeceptionHistory(),
@@ -209,8 +217,15 @@ function recordRequest(
     url,
     status,
     headers = {},
+    rawHeaders = [],
+    httpVersion = null,
     body,
     tags,
+    blTags,
+    csrfTags,
+    loginAttemptEmail,
+    resetPasswordEmail,
+    securityQuestionEmail,
     authGroupId,
     normalizedPath: suppliedNormalizedPath,
     payloadFingerprint = null,
@@ -223,14 +238,28 @@ function recordRequest(
     responseContentLength = null,
     responseBodyBytes = null,
     attackDetection = null,
+    backgroundTraffic = null,
     deceptionEvents = [],
+    clientIdentity = null,
+    accountIdentity = null,
     ts,
   }
 ) {
   const s = getOrCreateSession(sessionId, ip);
   const now = Number.isFinite(ts) ? ts : Date.now();
-  const fingerprint = headerFingerprint(headers);
+  const legacyFingerprint = headerFingerprint(headers);
+  const legacyActorId = deriveActorId(ip, legacyFingerprint);
+  const httpFingerprint = buildHttpFingerprint({
+    headers,
+    rawHeaders,
+    httpVersion,
+    method,
+  });
+  // V2 안정 Client Profile을 실제 Candidate 그룹 키로 사용한다. Accept처럼 요청
+  // 종류마다 달라지는 값은 requestFingerprint에만 남겨 동일 브라우저 분할을 막는다.
+  const fingerprint = httpFingerprint.clientFingerprint;
   const actorId = deriveActorId(ip, fingerprint);
+  const actorV2Id = actorId;
   const normalizedPath = suppliedNormalizedPath || normalizePath(url);
   const normalizedMethod = String(method || "GET").toUpperCase();
   const operation = `${normalizedMethod} ${normalizedPath}`;
@@ -248,15 +277,30 @@ function recordRequest(
   s.lastSeen = now;
 
   const requestRecord = {
+    requestId: `request:${crypto.randomUUID()}`,
     ts: now,
     method: normalizedMethod,
     url,
     normalizedPath,
     operation,
     status,
+    ip,
     sessionId,
     actorId,
+    legacyActorId,
+    legacyFingerprint,
+    actorV2Id,
+    httpFingerprint,
     authGroupId: authGroupId || null,
+    resolvedActorId: null,
+    resolutionMembershipId: null,
+    clientId: clientIdentity?.valid ? clientIdentity.clientId : null,
+    clientContinuityVerified: Boolean(
+      clientIdentity?.continuityVerified === true || clientIdentity?.source === "verified"
+    ),
+    clientIdentitySource: clientIdentity?.source || null,
+    accountId: accountIdentity?.accountId || null,
+    accountVerified: Boolean(accountIdentity?.verified),
     payloadFingerprint,
     hasAuthorization: requestHasAuthorization,
     experimentRunId: experimentRunId || null,
@@ -267,6 +311,16 @@ function recordRequest(
     responseContentLength,
     responseBodyBytes,
     attackDetection,
+    backgroundTraffic: backgroundTraffic?.isBackground
+      ? {
+          isBackground: true,
+          category: backgroundTraffic.category,
+          label: backgroundTraffic.label,
+          transport: backgroundTraffic.transport,
+          connectionId: backgroundTraffic.connectionId,
+          connectionPhase: backgroundTraffic.connectionPhase,
+        }
+      : null,
     deceptionEvents: Array.isArray(deceptionEvents)
       ? deceptionEvents.map((event) => ({
           eventId: event.eventId,
@@ -279,12 +333,33 @@ function recordRequest(
         }))
       : [],
     body: truncateBody(body),
+    blTags: blTags || [],
+    csrfTags: csrfTags || [],
+    loginAttemptEmail: loginAttemptEmail || null,
+    resetPasswordEmail: resetPasswordEmail || null,
+    securityQuestionEmail: securityQuestionEmail || null,
     tags: tags || [],
   };
   s.requests.push(requestRecord);
   if (s.requests.length > MAX_REQUESTS_PER_SESSION) {
     s.requests.shift();
   }
+
+  const resolution = actorResolver.observe({
+    sessionId,
+    candidateId: actorId,
+    ip,
+    clientIdentity,
+    authGroupId,
+    accountIdentity,
+    fingerprint,
+    operation,
+    ts: now,
+  });
+  requestRecord.resolvedActorId = resolution.resolvedActorId;
+  requestRecord.resolutionMembershipId = resolution.membershipId;
+  s.resolvedActorId = resolution.resolvedActorId;
+  s.resolutionMembershipId = resolution.membershipId;
 
   if (authGroupId) {
     if (!authGroups.has(authGroupId)) {
@@ -318,6 +393,7 @@ function recordRequest(
       id: actorId,
       ip,
       fingerprint,
+      clientFingerprintV2: httpFingerprint.clientFingerprint,
       headerSample: withoutSensitiveHeaders(headers),
       userAgent: headers["user-agent"] || "",
       firstSeen: now,
@@ -330,6 +406,7 @@ function recordRequest(
     });
   }
   const actor = actors.get(actorId);
+  actor.clientFingerprintV2 = httpFingerprint.clientFingerprint;
   actor.lastSeen = now;
   actor.totalRequests++;
   actor.sessionIds.add(sessionId);
@@ -421,6 +498,199 @@ function getIpEntry(ip) {
   return ipEntries.get(ip);
 }
 
+function serializeMembership(membership) {
+  return {
+    membershipId: membership.membershipId,
+    resolvedActorId: membership.resolvedActorId,
+    sessionId: membership.sessionId,
+    candidateId: membership.candidateId,
+    candidateIds: [...membership.candidateIds],
+    status: membership.status,
+    confidence: membership.confidence,
+    reasonCodes: [...membership.reasonCodes],
+    conflicts: [...membership.conflicts],
+    createdAt: membership.createdAt,
+    updatedAt: membership.updatedAt,
+    lastConfirmedAt: membership.lastConfirmedAt,
+    active: membership.active,
+    resolverVersion: membership.resolverVersion,
+    requestCount: membership.requestCount,
+  };
+}
+
+function aggregateAttackHistory(memberSessions) {
+  const histories = memberSessions.map((session) => session.attackHistory || emptyAttackHistory());
+  const firstTimes = histories.map((history) => history.firstAttackAt).filter(Number.isFinite);
+  const lastTimes = histories.map((history) => history.lastAttackAt).filter(Number.isFinite);
+  return {
+    hasAttackHistory: histories.some((history) => history.hasAttackHistory),
+    maxAttackScore: Math.max(0, ...histories.map((history) => Number(history.maxAttackScore) || 0)),
+    maxCrsAnomalyScore: Math.max(0, ...histories.map((history) => Number(history.maxCrsAnomalyScore) || 0)),
+    cumulativeRuleHits: histories.reduce(
+      (sum, history) => sum + (Number(history.cumulativeRuleHits) || 0),
+      0
+    ),
+    matchedRuleIds: [...new Set(histories.flatMap((history) => history.matchedRuleIds || []))],
+    attackCategories: [...new Set(histories.flatMap((history) => history.attackCategories || []))],
+    firstAttackAt: firstTimes.length ? Math.min(...firstTimes) : null,
+    lastAttackAt: lastTimes.length ? Math.max(...lastTimes) : null,
+  };
+}
+
+function aggregateDeceptionHistory(memberSessions) {
+  const histories = memberSessions.map((session) => session.deceptionHistory || emptyDeceptionHistory());
+  const recentEvents = histories
+    .flatMap((history) => history.recentEvents || [])
+    .filter((event, index, all) => all.findIndex((item) => item.eventId === event.eventId) === index)
+    .sort((a, b) => a.occurredAt - b.occurredAt)
+    .slice(-MAX_DECEPTION_EVENTS_PER_ENTITY);
+  const signalCounts = {};
+  for (const history of histories) {
+    for (const [signal, count] of Object.entries(history.signalCounts || {})) {
+      signalCounts[signal] = (signalCounts[signal] || 0) + Number(count || 0);
+    }
+  }
+  const levels = histories.map((history) => history.strongestEvidenceLevel).filter(Boolean);
+  const firstTimes = histories.map((history) => history.firstEventAt).filter(Number.isFinite);
+  const lastTimes = histories.map((history) => history.lastEventAt).filter(Number.isFinite);
+  return {
+    hasEvidence: histories.some((history) => history.hasEvidence),
+    totalEvents: histories.reduce((sum, history) => sum + Number(history.totalEvents || 0), 0),
+    distinctSignals: [...new Set(histories.flatMap((history) => history.distinctSignals || []))],
+    distinctScoredSignals: [
+      ...new Set(histories.flatMap((history) => history.distinctScoredSignals || [])),
+    ],
+    signalCounts,
+    strongestEvidenceLevel: levels.sort(
+      (a, b) => EVIDENCE_LEVEL_ORDER[b] - EVIDENCE_LEVEL_ORDER[a]
+    )[0] || null,
+    firstEventAt: firstTimes.length ? Math.min(...firstTimes) : null,
+    lastEventAt: lastTimes.length ? Math.max(...lastTimes) : null,
+    recentEvents,
+  };
+}
+
+function getResolvedActorAggregate(resolvedActorId, { includeProvisional = false } = {}) {
+  const actor = actorResolver.getActor(resolvedActorId);
+  if (!actor) return null;
+  const memberships = actorResolver.getMembershipsForActor(resolvedActorId);
+  const includedStatuses = new Set([MEMBERSHIP_STATUS.CONFIRMED]);
+  if (includeProvisional) includedStatuses.add(MEMBERSHIP_STATUS.PROVISIONAL);
+  const includedMemberships = memberships.filter(
+    (membership) => membership.active && includedStatuses.has(membership.status)
+  );
+  const sessionIds = [...new Set(includedMemberships.map((membership) => membership.sessionId))];
+  const memberSessions = sessionIds.map((id) => sessions.get(id)).filter(Boolean);
+  const requestIds = new Set();
+  const requests = [];
+  for (const session of memberSessions) {
+    for (const request of session.requests) {
+      const key = request.requestId || `${request.sessionId}\u0000${request.ts}\u0000${request.operation}`;
+      if (requestIds.has(key)) continue;
+      requestIds.add(key);
+      requests.push(request);
+    }
+  }
+  requests.sort((a, b) => a.ts - b.ts);
+  if (requests.length > MAX_REQUESTS_PER_RESOLVED_ACTOR) {
+    requests.splice(0, requests.length - MAX_REQUESTS_PER_RESOLVED_ACTOR);
+  }
+
+  const candidateIds = [...actor.candidateIds];
+  const observedIps = [...actor.observedIps.keys()];
+  const statuses = memberships.filter((membership) => membership.active).map((membership) => membership.status);
+  const observedMemberships = memberships.filter((membership) => membership.active);
+  const observedSessionIds = [...new Set(observedMemberships.map((membership) => membership.sessionId))];
+  const status = !statuses.length
+    ? "INACTIVE"
+    : statuses.includes(MEMBERSHIP_STATUS.CONFIRMED)
+      ? MEMBERSHIP_STATUS.CONFIRMED
+      : statuses.includes(MEMBERSHIP_STATUS.PROVISIONAL)
+        ? MEMBERSHIP_STATUS.PROVISIONAL
+        : statuses.includes(MEMBERSHIP_STATUS.SUGGESTED)
+          ? MEMBERSHIP_STATUS.SUGGESTED
+          : MEMBERSHIP_STATUS.CONFLICT;
+  const confidence = status === MEMBERSHIP_STATUS.CONFIRMED
+    ? "HIGH"
+    : status === MEMBERSHIP_STATUS.PROVISIONAL
+      ? "MEDIUM"
+      : status === MEMBERSHIP_STATUS.SUGGESTED
+        ? "LOW"
+        : "NONE";
+
+  return {
+    id: actor.id,
+    firstSeen: actor.firstSeen,
+    lastSeen: actor.lastSeen,
+    status,
+    confidence,
+    sessionIds,
+    observedSessionIds,
+    candidateIds,
+    confirmedMemberships: memberships.filter(
+      (membership) => membership.active && membership.status === MEMBERSHIP_STATUS.CONFIRMED
+    ).map(serializeMembership),
+    provisionalMemberships: memberships.filter(
+      (membership) => membership.active && membership.status === MEMBERSHIP_STATUS.PROVISIONAL
+    ).map(serializeMembership),
+    memberships: memberships.map(serializeMembership),
+    observedIps,
+    ipFirstSeen: Object.fromEntries(
+      observedIps.map((ip) => [ip, actor.observedIps.get(ip)?.firstSeen || null])
+    ),
+    ipLastSeen: Object.fromEntries(
+      observedIps.map((ip) => [ip, actor.observedIps.get(ip)?.lastSeen || null])
+    ),
+    ipChangeCount: actor.ipChangeCount,
+    clientIds: [...actor.clientIds.keys()],
+    accountAffiliations: Array.from(actor.accountAffiliations.values(), (entry) => ({
+      accountId: entry.accountId,
+      verified: entry.verified,
+      verification: entry.verification,
+      claim: entry.claim,
+      firstSeen: entry.firstSeen,
+      lastSeen: entry.lastSeen,
+      authGroupIds: [...entry.authGroupIds],
+    })),
+    authGroupIds: [...actor.authGroupIds.keys()],
+    evidence: actor.evidence.map((item) => ({ ...item })),
+    conflicts: actor.conflicts.map((item) => ({ ...item })),
+    continuityConfirmed: includedMemberships.some(
+      (membership) => membership.status === MEMBERSHIP_STATUS.CONFIRMED
+    ),
+    observedTotalRequests: observedMemberships.reduce(
+      (sum, membership) => sum + Number(membership.requestCount || 0),
+      0
+    ),
+    totalRequests: includedMemberships.reduce(
+      (sum, membership) => sum + Number(membership.requestCount || 0),
+      0
+    ),
+    requests,
+    memberSessions,
+    attackHistory: aggregateAttackHistory(memberSessions),
+    deceptionHistory: aggregateDeceptionHistory(memberSessions),
+    aggregationPolicy: includeProvisional ? "CONFIRMED_AND_PROVISIONAL" : "CONFIRMED_ONLY",
+  };
+}
+
+function getAllResolvedActorAggregates(options) {
+  return actorResolver.getAllActors().map((actor) => getResolvedActorAggregate(actor.id, options));
+}
+
+function getResolutionMemberships(resolvedActorId) {
+  if (!actorResolver.getActor(resolvedActorId)) return null;
+  return actorResolver.getMembershipsForActor(resolvedActorId).map(serializeMembership);
+}
+
+function deactivateResolutionMembership(membershipId, reason) {
+  return actorResolver.deactivateMembership(membershipId, reason);
+}
+
+function getResolutionStatus() {
+  return actorResolver.status();
+}
+
 module.exports = {
   getOrCreateSession,
   recordRequest,
@@ -433,6 +703,11 @@ module.exports = {
   getAuthGroup,
   getAllIpEntries,
   getIpEntry,
+  getResolvedActorAggregate,
+  getAllResolvedActorAggregates,
+  getResolutionMemberships,
+  deactivateResolutionMembership,
+  getResolutionStatus,
   updateAttackScoreHistory,
   emptyAttackHistory,
   emptyDeceptionHistory,

@@ -1,5 +1,6 @@
 const { isAutomationUA, missingBrowserHeaders } = require("./uaSignatures");
 const { FEATURE_WINDOWS } = require("./featureWindows");
+const { isBehaviorAnalyzable } = require("./backgroundTraffic");
 
 function mean(arr) {
   if (!arr.length) return 0;
@@ -28,6 +29,67 @@ function maxRequestsInWindow(timestamps, windowMs) {
 }
 
 const maxBurst = maxRequestsInWindow;
+
+const IDOR_RESOURCE_ID_PATTERN =
+  /\/(users?|orders?|accounts?|baskets?|address(?:es)?|cards?|wallets?|deliver(?:y|ies)?)\/(\d+)/i;
+
+function extractIdorWalkSignal(attackRequests) {
+  const idsByResource = new Map();
+  for (const request of attackRequests) {
+    const match = String(request.url || "").match(IDOR_RESOURCE_ID_PATTERN);
+    if (!match) continue;
+    const resource = match[1].toLowerCase();
+    if (!idsByResource.has(resource)) idsByResource.set(resource, new Set());
+    idsByResource.get(resource).add(Number(match[2]));
+  }
+
+  return {
+    maxDistinctIdsPerResource: Math.max(0, ...Array.from(idsByResource.values(), (ids) => ids.size)),
+  };
+}
+
+const LOGIN_ROUTE_METHOD = "POST";
+const LOGIN_ROUTE_PATH = "/rest/user/login";
+const RESET_PASSWORD_ROUTE_METHOD = "POST";
+const RESET_PASSWORD_ROUTE_PATH = "/rest/user/reset-password";
+const SECURITY_QUESTION_ROUTE_METHOD = "GET";
+const SECURITY_QUESTION_ROUTE_PATH = "/rest/user/security-question";
+
+function extractLoginBruteForceSignal(attackRequests) {
+  const failedLogins = attackRequests.filter(
+    (request) =>
+      request.method === LOGIN_ROUTE_METHOD &&
+      request.normalizedPath === LOGIN_ROUTE_PATH &&
+      request.status === 401 &&
+      request.loginAttemptEmail
+  );
+  const resetPasswordAttempts = attackRequests.filter(
+    (request) =>
+      request.method === RESET_PASSWORD_ROUTE_METHOD &&
+      request.normalizedPath === RESET_PASSWORD_ROUTE_PATH &&
+      request.resetPasswordEmail
+  );
+  const securityQuestionProbes = attackRequests.filter(
+    (request) =>
+      request.method === SECURITY_QUESTION_ROUTE_METHOD &&
+      request.normalizedPath === SECURITY_QUESTION_ROUTE_PATH &&
+      request.securityQuestionEmail
+  );
+
+  const attemptsByEmail = new Map();
+  const tally = (email) => attemptsByEmail.set(email, (attemptsByEmail.get(email) || 0) + 1);
+  failedLogins.forEach((request) => tally(request.loginAttemptEmail));
+  resetPasswordAttempts.forEach((request) => tally(request.resetPasswordEmail));
+  securityQuestionProbes.forEach((request) => tally(request.securityQuestionEmail));
+
+  return {
+    failedLoginCount: failedLogins.length,
+    resetPasswordAttemptCount: resetPasswordAttempts.length,
+    securityQuestionProbeCount: securityQuestionProbes.length,
+    distinctEmailsAttempted: attemptsByEmail.size,
+    maxAttemptsPerEmail: Math.max(0, ...attemptsByEmail.values()),
+  };
+}
 
 function maxConsecutiveRepeats(operations) {
   if (!operations.length) return 0;
@@ -81,7 +143,15 @@ function extractStreamFeatures({
   deceptionHistory = null,
 }) {
   const ordered = [...requests].sort((a, b) => a.ts - b.ts);
-  const timingRequests = recent(ordered, FEATURE_WINDOWS.timingRequests);
+  const behaviorRequests = ordered.filter(isBehaviorAnalyzable);
+  const backgroundRequests = ordered.filter((request) => !isBehaviorAnalyzable(request));
+  const backgroundByCategory = {};
+  for (const request of backgroundRequests) {
+    const category = request.backgroundTraffic?.category || "background";
+    backgroundByCategory[category] = (backgroundByCategory[category] || 0) + 1;
+  }
+
+  const timingRequests = recent(behaviorRequests, FEATURE_WINDOWS.timingRequests);
   const timestamps = timingRequests.map((request) => request.ts);
   const intervals = [];
   for (let index = 1; index < timestamps.length; index++) {
@@ -96,8 +166,8 @@ function extractStreamFeatures({
     ? 0
     : timestamps.filter((timestamp) => latestTimestamp - timestamp <= FEATURE_WINDOWS.intensityLongMs).length;
 
-  const sequenceRequests = recent(ordered, FEATURE_WINDOWS.sequenceRequests);
-  const repeatedRequests = recent(ordered, FEATURE_WINDOWS.repeatedRequests);
+  const sequenceRequests = recent(behaviorRequests, FEATURE_WINDOWS.sequenceRequests);
+  const repeatedRequests = recent(behaviorRequests, FEATURE_WINDOWS.repeatedRequests);
   const repeatedOperations = repeatedRequests.map((request) => request.operation);
   const operationCounts = new Map();
   for (const operation of repeatedOperations) {
@@ -105,7 +175,7 @@ function extractStreamFeatures({
   }
   const mostRepeatedCount = operationCounts.size ? Math.max(...operationCounts.values()) : 0;
 
-  const diversityRequests = recent(ordered, FEATURE_WINDOWS.diversityRequests);
+  const diversityRequests = recent(behaviorRequests, FEATURE_WINDOWS.diversityRequests);
   const uniquePaths = new Set(diversityRequests.map((request) => request.normalizedPath));
   const uniqueApiPaths = new Set(
     diversityRequests
@@ -113,7 +183,7 @@ function extractStreamFeatures({
       .map((request) => request.normalizedPath)
   );
 
-  const errorRequests = recent(ordered, FEATURE_WINDOWS.errorRequests);
+  const errorRequests = recent(behaviorRequests, FEATURE_WINDOWS.errorRequests);
   const notFoundCount = errorRequests.filter((request) => request.status === 404).length;
   const accessDeniedCount = errorRequests.filter(
     (request) => request.status === 401 || request.status === 403
@@ -134,9 +204,17 @@ function extractStreamFeatures({
   );
   const deceptionSignalCounts = { ...(deceptionHistory?.signalCounts || {}) };
 
-  const attackRequests = recent(ordered, FEATURE_WINDOWS.attackRequests);
+  // 공격 증거는 최근 50건 창에서 제거하지 않고, 보관 중인 entity lifecycle 전체로 집계한다.
+  // Session 저장소의 메모리 상한과 과거 최고 Attack Score는 별도로 유지된다.
+  const attackRequests = ordered;
   const allTags = attackRequests.flatMap((request) => request.tags || []);
   const attackCategories = Array.from(new Set(allTags));
+  const idorWalk = extractIdorWalkSignal(attackRequests);
+  const loginBruteForce = extractLoginBruteForceSignal(attackRequests);
+  const allBlTags = attackRequests.flatMap((request) => request.blTags || []);
+  const businessLogicCategories = Array.from(new Set(allBlTags));
+  const allCsrfTags = attackRequests.flatMap((request) => request.csrfTags || []);
+  const csrfCategories = Array.from(new Set(allCsrfTags));
   const crsResults = attackRequests
     .map((request) => request.attackDetection)
     .filter((result) => result?.available);
@@ -153,6 +231,14 @@ function extractStreamFeatures({
 
   return {
     totalRequests: ordered.length,
+    behaviorAnalyzedRequests: behaviorRequests.length,
+    backgroundRequests: backgroundRequests.length,
+    requestAccounting: {
+      totalRequests: ordered.length,
+      behaviorAnalyzedRequests: behaviorRequests.length,
+      backgroundRequests: backgroundRequests.length,
+      backgroundByCategory,
+    },
     sessionDurationMs: Math.max(0, (lastSeen || 0) - (firstSeen || 0)),
     fingerprint: fingerprint || null,
     userAgent: ua,
@@ -220,6 +306,14 @@ function extractStreamFeatures({
         ? Math.max(...crsResults.map((result) => Number(result.anomalyScore) || 0))
         : 0,
       matchedRuleIds,
+      idorWalk,
+      loginBruteForce,
+      businessLogicHits: allBlTags.length,
+      distinctBusinessLogicCategories: businessLogicCategories.length,
+      businessLogicCategories,
+      csrfHits: allCsrfTags.length,
+      distinctCsrfCategories: csrfCategories.length,
+      csrfCategories,
     },
   };
 }
@@ -269,6 +363,26 @@ function extractAuthGroupFeatures(group, getSession) {
   });
 }
 
+function extractResolvedActorFeatures(aggregate) {
+  const memberSessions = aggregate.memberSessions || [];
+  const representative = [...memberSessions]
+    .sort((a, b) => b.lastSeen - a.lastSeen)
+    .find((session) => session.headerSample) || memberSessions[0];
+  return extractStreamFeatures({
+    requests: aggregate.requests || [],
+    // Resolved Actor는 여러 header fingerprint를 포함할 수 있으므로 가장 최근
+    // CONFIRMED Session의 클라이언트 관찰값만 대표값으로 사용한다.
+    headerSample: representative ? representative.headerSample : null,
+    fingerprint: null,
+    userAgent: representative ? representative.userAgent : "",
+    telemetry: aggregateTelemetry(memberSessions),
+    firstSeen: aggregate.firstSeen,
+    lastSeen: aggregate.lastSeen,
+    sessionChurn: aggregate.sessionIds.length,
+    deceptionHistory: aggregate.deceptionHistory,
+  });
+}
+
 function extractIpFeatures(ipEntry, getSession) {
   const memberSessions = Array.from(ipEntry.sessionIds, (id) => getSession(id)).filter(Boolean);
   return extractStreamFeatures({
@@ -287,6 +401,7 @@ module.exports = {
   extractFeatures,
   extractActorFeatures,
   extractAuthGroupFeatures,
+  extractResolvedActorFeatures,
   extractIpFeatures,
   extractStreamFeatures,
   aggregateTelemetry,
@@ -294,4 +409,6 @@ module.exports = {
   stdev,
   maxBurst,
   maxRequestsInWindow,
+  extractIdorWalkSignal,
+  extractLoginBruteForceSignal,
 };
